@@ -36,6 +36,11 @@ uv run mlx_video.generate --model-repo Lightricks/LTX-2.5 \
     --prompt "A traveler crosses a valley and pauses to watch the sunrise" \
     --auto-duration 2 10 --width 768 --height 512
 
+# Enhance a short prompt with a separate generative Gemma 4 model
+uv run mlx_video.generate --model-repo Lightricks/LTX-2.5 \
+    --prompt "A cat walking through grass" --enhance-prompt \
+    --width 768 --height 512
+
 # Dev - single-stage with CFG
 uv run mlx_video.generate --pipeline dev --prompt "A cinematic scene" --cfg-scale 3.0
 
@@ -157,6 +162,7 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | `--width`, `-W` | 512 | Output width (divisible by 64 for two-stage, 32 for dev) |
 | `--num-frames`, `-n` | 33 for LTX-2/2.3; predicted for LTX-2.5 | Number of frames (must be 1 + 8*k) |
 | `--auto-duration` | `1 20` | Min/max seconds for LTX-2.5 duration prediction when `--num-frames` is omitted |
+| `--prompt-enhancer-repo` | `mlx-community/gemma-4-e2b-it-bf16` | Separate generative Gemma 4 checkpoint used by `--enhance-prompt` with LTX-2.5 |
 | `--seed`, `-s` | 42 | Random seed for reproducibility |
 | `--fps` | 24 | Frames per second |
 | `--output-path`, `-o` | output.mp4 | Output video path |

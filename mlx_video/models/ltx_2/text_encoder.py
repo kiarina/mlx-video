@@ -227,7 +227,7 @@ class Gemma4LanguageModel(nn.Module):
         from mlx_vlm.models.gemma4.language import LanguageModel as Gemma4Model
         from mlx_vlm.models.gemma4_unified.config import TextConfig as Gemma4Config
 
-        self.config = Gemma4Config.from_dict(config)
+        self.config = Gemma4Config.from_dict(config["text_config"])
         self.model = Gemma4Model(self.config)
 
     def _attention_mask(self, attention_mask: mx.array, dtype: mx.Dtype) -> mx.array:
@@ -285,7 +285,7 @@ class Gemma4LanguageModel(nn.Module):
 
         checkpoint_path = Path(checkpoint_path)
         with safe_open(checkpoint_path, framework="numpy") as f:
-            config = json.loads((f.metadata() or {})["gemma_config"])["text_config"]
+            config = json.loads((f.metadata() or {})["gemma_config"])
         model = cls(config)
         weights = {
             key: value
@@ -328,6 +328,48 @@ def load_packed_tokenizer(checkpoint_path: str | Path):
         model_max_length=1024,
         **kwargs,
     )
+
+
+def enhance_prompt_gemma4(
+    prompt: str,
+    model_repo: str,
+    image: str | None = None,
+    max_tokens: int = 600,
+    seed: int = 42,
+    verbose: bool = True,
+) -> str:
+    """Enhance an LTX-2.5 prompt with a separate generative Gemma 4 model."""
+    from mlx_vlm import generate, load
+    from mlx_vlm.prompt_utils import apply_chat_template
+
+    model, processor = load(model_repo)
+    prompt_name = (
+        "gemma4_i2v_system_prompt.txt" if image else "gemma4_t2v_system_prompt.txt"
+    )
+    messages = [
+        {"role": "system", "content": _load_system_prompt(prompt_name)},
+        {"role": "user", "content": f"user prompt: {prompt}"},
+    ]
+    formatted = apply_chat_template(
+        processor,
+        model.config,
+        messages,
+        num_images=1 if image else 0,
+    )
+    mx.random.seed(seed)
+    result = generate(
+        model=model,
+        processor=processor,
+        prompt=formatted,
+        image=image,
+        max_tokens=max_tokens,
+        temperature=0.0,
+        verbose=verbose,
+    )
+    enhanced = re.sub(r"^[^\w\s]+", "", result.text.strip())
+    del model
+    mx.clear_cache()
+    return enhanced
 
 
 class ConnectorAttention(nn.Module):
@@ -1216,12 +1258,22 @@ class LTX2TextEncoder(nn.Module):
     @functools.cached_property
     def default_t2v_system_prompt(self) -> str:
         """Load the default T2V system prompt."""
-        return _load_system_prompt("gemma_t2v_system_prompt.txt")
+        prompt_name = (
+            "gemma4_t2v_system_prompt.txt"
+            if isinstance(self.language_model, Gemma4LanguageModel)
+            else "gemma_t2v_system_prompt.txt"
+        )
+        return _load_system_prompt(prompt_name)
 
     @functools.cached_property
     def default_i2v_system_prompt(self) -> str:
         """Load the default I2V system prompt."""
-        return _load_system_prompt("gemma_i2v_system_prompt.txt")
+        prompt_name = (
+            "gemma4_i2v_system_prompt.txt"
+            if isinstance(self.language_model, Gemma4LanguageModel)
+            else "gemma_i2v_system_prompt.txt"
+        )
+        return _load_system_prompt(prompt_name)
 
     def _clean_response(self, response: str) -> str:
         """Clean up the generated response."""
@@ -1236,6 +1288,12 @@ class LTX2TextEncoder(nn.Module):
         messages: List[Dict[str, str]],
     ) -> str:
         """Apply Gemma chat template to messages."""
+        if isinstance(self.language_model, Gemma4LanguageModel):
+            return self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         # Gemma 3 chat template format
         formatted = ""
         for msg in messages:

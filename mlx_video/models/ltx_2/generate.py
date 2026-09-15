@@ -62,6 +62,7 @@ STAGE_1_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.42187
 STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
 
 LTX25_MODEL_REPO = "Lightricks/LTX-2.5"
+LTX25_PROMPT_ENHANCER_REPO = "mlx-community/gemma-4-e2b-it-bf16"
 LTX25_REQUIRED_FILES = [
     "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
     "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
@@ -1819,6 +1820,7 @@ def generate_video(
     spatial_upscaler: Optional[str] = None,
     auto_duration_min_seconds: float = 1.0,
     auto_duration_max_seconds: float = 20.0,
+    prompt_enhancer_repo: str = LTX25_PROMPT_ENHANCER_REPO,
 ):
     """Generate video using LTX-2 models.
 
@@ -2040,6 +2042,25 @@ def generate_video(
     if not is_ltx25_split and transformer_config_path.exists():
         with open(transformer_config_path) as f:
             has_prompt_adaln = json.load(f).get("has_prompt_adaln", False)
+
+    if enhance_prompt and is_ltx25_split:
+        from mlx_video.models.ltx_2.text_encoder import enhance_prompt_gemma4
+
+        with console.status(
+            "[magenta]✨ Enhancing prompt with Gemma 4...[/]", spinner="dots"
+        ):
+            prompt = enhance_prompt_gemma4(
+                prompt,
+                model_repo=prompt_enhancer_repo,
+                image=image,
+                max_tokens=max_tokens,
+                seed=seed,
+                verbose=False,
+            )
+        console.print(
+            f"[dim]Enhanced: {prompt[:150]}{'...' if len(prompt) > 150 else ''}[/]"
+        )
+        enhance_prompt = False
 
     # Load text encoder
     with console.status("[blue]📝 Loading text encoder...[/]", spinner="dots"):
@@ -3384,6 +3405,12 @@ Examples:
         "--enhance-prompt", action="store_true", help="Enhance the prompt using Gemma"
     )
     parser.add_argument(
+        "--prompt-enhancer-repo",
+        type=str,
+        default=LTX25_PROMPT_ENHANCER_REPO,
+        help="Generative Gemma 4 model used to enhance LTX-2.5 prompts",
+    )
+    parser.add_argument(
         "--max-tokens", type=int, default=512, help="Max tokens for prompt enhancement"
     )
     parser.add_argument(
@@ -3586,6 +3613,7 @@ Examples:
         spatial_upscaler=args.spatial_upscaler,
         auto_duration_min_seconds=args.auto_duration[0],
         auto_duration_max_seconds=args.auto_duration[1],
+        prompt_enhancer_repo=args.prompt_enhancer_repo,
     )
 
 
