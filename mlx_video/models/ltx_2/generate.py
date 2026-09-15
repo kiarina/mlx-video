@@ -61,6 +61,14 @@ class PipelineType(Enum):
 STAGE_1_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
 STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
 
+LTX25_MODEL_REPO = "Lightricks/LTX-2.5"
+LTX25_REQUIRED_FILES = [
+    "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+    "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+    "vae/ltx-2.5-video-vae-conv-bf16.safetensors",
+    "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+]
+
 # Dev model scheduling constants
 BASE_SHIFT_ANCHOR = 1024
 MAX_SHIFT_ANCHOR = 4096
@@ -1914,9 +1922,18 @@ def generate_video(
         )
 
     # Get model path
-    model_path = get_model_path(model_repo)
+    ltx25_patterns = None
+    if model_repo.rstrip("/") == LTX25_MODEL_REPO:
+        ltx25_patterns = LTX25_REQUIRED_FILES
+    model_path = get_model_path(model_repo, allow_patterns=ltx25_patterns)
     is_ltx25_split = (model_path / "diffusion_models").is_dir()
     if is_ltx25_split:
+        if pipeline is not PipelineType.DISTILLED:
+            raise ValueError("LTX-2.5 currently supports only the distilled pipeline")
+        if audio or is_a2v:
+            raise ValueError(
+                "LTX-2.5 audio generation and audio conditioning are not yet supported"
+            )
         transformer_files = sorted(
             (model_path / "diffusion_models").glob(
                 "*distilled-transformer-bf16.safetensors"

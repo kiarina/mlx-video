@@ -2,6 +2,11 @@
 
 MLX port of [LTX-2](https://huggingface.co/Lightricks/LTX-2), a 19B parameter video generation model from Lightricks with synchronized audio-video support.
 
+LTX-2.5 distilled text-to-video and image-to-video are also supported using the
+official split checkpoints. Accept the model terms on Hugging Face before the
+first download. The initial LTX-2.5 path uses the lighter convolutional video
+VAE; diffusion-VAE decoding and audio output are not yet supported.
+
 ## Pipelines
 
 Four pipeline types are available via the `--pipeline` flag:
@@ -20,6 +25,10 @@ Four pipeline types are available via the `--pipeline` flag:
 ```bash
 # Distilled (default) - fast, two-stage
 uv run mlx_video.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768
+
+# LTX-2.5 distilled (downloads only the required split components)
+uv run mlx_video.generate --model-repo Lightricks/LTX-2.5 \
+    --prompt "Ocean waves at golden hour" -n 121 --width 768 --height 512
 
 # Dev - single-stage with CFG
 uv run mlx_video.generate --pipeline dev --prompt "A cinematic scene" --cfg-scale 3.0
