@@ -47,6 +47,7 @@ Repository = "https://github.com/Blaizzy/mlx-video"
 Issues = "https://github.com/Blaizzy/mlx-video/issues"
 
 [project.scripts]
+"mlx_video.generate" = "mlx_video.models.ltx_2.generate:main"
 "mlx_video.ltx_2.generate" = "mlx_video.models.ltx_2.generate:main"
 "mlx_video.wan_2.generate" = "mlx_video.models.wan_2.generate:main"
 
