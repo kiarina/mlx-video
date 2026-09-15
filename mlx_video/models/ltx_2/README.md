@@ -5,7 +5,8 @@ MLX port of [LTX-2](https://huggingface.co/Lightricks/LTX-2), a 19B parameter vi
 LTX-2.5 distilled text-to-video and image-to-video are also supported using the
 official split checkpoints. Accept the model terms on Hugging Face before the
 first download. The initial LTX-2.5 path uses the lighter convolutional video
-VAE; diffusion-VAE decoding and audio output are not yet supported.
+VAE; diffusion-VAE decoding is not yet supported. Audio-to-video and
+synchronized audio-video generation use the split LTX-2.5 audio VAE and vocoder.
 
 ## Pipelines
 
