@@ -126,11 +126,16 @@ inference-only Metal kernel for 3D neighborhood attention. The kernel performs
 online softmax without materializing the neighborhood score tensor and has a
 SIMD-group specialization for the model's head dimension of 64.
 
+DFR-generated keyframes are passed through all five decoder stages when DFR and
+the diffusion decoder are selected together. The joint Metal attention lets
+each video query attend to its two nearest keyframe planes and lets each
+keyframe query attend to its two nearest video frames.
+
 Stage 4 and stage 5 can be spatially tiled with a receptive-field halo. For
 example, `--diffusion-vae-spatial-tiles 2` processes a 2x2 tile grid to reduce
 peak memory at the cost of repeated halo computation. Temporal tiling and DFR
-generated-keyframe decoding are not yet supported. The convolutional decoder
-remains the default lower-memory path.
+keyframe-aware tiling are not yet supported. The convolutional decoder remains
+the default lower-memory path.
 
 ### Image-to-Video (I2V)
 

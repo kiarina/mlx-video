@@ -62,3 +62,28 @@ def test_spatial_tiling_matches_full_decode_with_receptive_field_halo():
     mx.eval(full, tiled)
     assert tiled.shape == full.shape
     assert mx.allclose(tiled, full, atol=2e-4, rtol=2e-4)
+
+
+def test_keyframe_aware_decoder_runs_both_streams():
+    mx.random.seed(41)
+    model = DiffusionVideoDecoder(
+        in_channels=8,
+        out_channels=1,
+        patch_size=2,
+        head_dim=64,
+        stage_channels=(64, 64, 64, 64, 64),
+        stage_depths=(1, 1, 1, 1, 1),
+        stage_kernels=((3, 3, 3),) * 5,
+        upsamples=(((1, 2, 2), 1),) * 4,
+    )
+    latent = mx.random.normal((1, 8, 1, 3, 3)).astype(mx.bfloat16)
+    keyframes = mx.random.normal((1, 8, 1, 3, 3)).astype(mx.bfloat16)
+    output = model(
+        latent,
+        seed=43,
+        keyframe_latents=keyframes,
+        keyframe_positions=[0],
+    )
+    mx.eval(output)
+    assert output.shape == (1, 1, 1, 96, 96)
+    assert mx.all(mx.isfinite(output))

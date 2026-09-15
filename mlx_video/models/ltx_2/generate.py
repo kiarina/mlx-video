@@ -2012,9 +2012,7 @@ def generate_video(
         text_encoder_path = text_encoder_files[0]
         video_vae_path = conv_vae_files[0]
         audio_vae_path = audio_vae_files[0]
-        diffusion_vae_path = (
-            diffusion_vae_files[0] if diffusion_vae_files else None
-        )
+        diffusion_vae_path = diffusion_vae_files[0] if diffusion_vae_files else None
         if video_decoder == "diffusion" and diffusion_vae_path is None:
             raise FileNotFoundError(
                 "--video-decoder diffusion requires "
@@ -3409,7 +3407,13 @@ def generate_video(
         console.print("[dim]  Decoder: diffusion VAE Metal prototype[/]")
         vae_decoder = DiffusionVideoDecoder.from_pretrained(diffusion_vae_path)
         video = vae_decoder(
-            latents, seed=seed, spatial_tiles=diffusion_vae_spatial_tiles
+            latents,
+            seed=seed,
+            spatial_tiles=diffusion_vae_spatial_tiles,
+            keyframe_latents=dfr_slots if pipeline is PipelineType.DFR else None,
+            keyframe_positions=(
+                dfr_keyframe_positions if pipeline is PipelineType.DFR else None
+            ),
         )
     elif tiling_config is not None:
         spatial_info = (
@@ -3519,9 +3523,7 @@ def generate_video(
             console.print("[green]✓[/] Audio decoded")
 
         if pipeline is PipelineType.DFR and num_frames != requested_num_frames:
-            requested_samples = round(
-                requested_num_frames / fps * vocoder_sample_rate
-            )
+            requested_samples = round(requested_num_frames / fps * vocoder_sample_rate)
             audio_np = audio_np[..., :requested_samples]
 
         audio_path = (

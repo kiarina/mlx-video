@@ -134,6 +134,35 @@ class DiffusionNABlock(nn.Module):
         mlp_input = self.norm2(x) * (1 + scale_mlp) + shift_mlp
         return x + self.mlp(mlp_input)
 
+    def forward_joint(
+        self,
+        context: mx.array,
+        x: mx.array,
+        keyframe_context: mx.array,
+        keyframes: mx.array,
+        modulation: tuple[mx.array, ...],
+        keyframe_times: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        values = tuple(
+            modulation[index] + self.scale_shift_table[index][None, None, None, None]
+            for index in range(7)
+        )
+        scale_msa, shift_msa, _, scale_mlp, shift_mlp, _, _ = values
+        x = x + self.context_proj(context)
+        keyframes = keyframes + self.context_proj(keyframe_context)
+        attention, keyframe_attention = self.attn.forward_joint(
+            self.norm1(x) * (1 + scale_msa) + shift_msa,
+            self.norm1(keyframes) * (1 + scale_msa) + shift_msa,
+            keyframe_times,
+        )
+        x = x + attention
+        keyframes = keyframes + keyframe_attention
+        x = x + self.mlp(self.norm2(x) * (1 + scale_mlp) + shift_mlp)
+        keyframes = keyframes + self.mlp(
+            self.norm2(keyframes) * (1 + scale_mlp) + shift_mlp
+        )
+        return x, keyframes
+
 
 class DiffusionVideoDecoder(nn.Module):
     def __init__(
@@ -202,6 +231,27 @@ class DiffusionVideoDecoder(nn.Module):
         self.norm_out = nn.RMSNorm(stage5_channels, eps=1e-6)
         self.conv_out = nn.Linear(stage5_channels, pixel_channels, bias=True)
 
+    @staticmethod
+    def _keyframe_times(
+        pixel_frame_indices: mx.array, remaining_stride: int
+    ) -> mx.array:
+        frames = pixel_frame_indices.astype(mx.float32)
+        offset = (remaining_stride - 1) / 2
+        times = (frames + offset) / remaining_stride
+        return mx.where(frames == 0, mx.zeros_like(times), times)
+
+    @staticmethod
+    def _upsample_keyframes(
+        upsampler: LinearPixelShuffleUpsample, keyframes: mx.array
+    ) -> mx.array:
+        batch, planes, height, width, channels = keyframes.shape
+        flat = mx.reshape(keyframes, (batch * planes, 1, height, width, channels))
+        output = upsampler(flat, drop_leading_frame=True)
+        return mx.reshape(
+            output[:, 0],
+            (batch, planes, output.shape[2], output.shape[3], output.shape[4]),
+        )
+
     def _stages_1_to_3(self, latent: mx.array) -> mx.array:
         latent = mx.concatenate(
             [latent, mx.repeat(latent[:, :, -1:], 2, axis=2)], axis=2
@@ -216,11 +266,51 @@ class DiffusionVideoDecoder(nn.Module):
             hidden = self.upsamples[stage_index](hidden)
         return hidden
 
+    def _stages_1_to_3_joint(
+        self,
+        latent: mx.array,
+        keyframe_latents: mx.array,
+        pixel_frame_indices: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        latent = mx.concatenate(
+            [latent, mx.repeat(latent[:, :, -1:], 2, axis=2)], axis=2
+        )
+        mean = self.mean_of_means[None, :, None, None, None]
+        std = self.std_of_means[None, :, None, None, None]
+        hidden = self.conv_in(mx.transpose(latent * std + mean, (0, 2, 3, 4, 1)))
+        keyframes = mx.transpose(keyframe_latents * std + mean, (0, 2, 3, 4, 1))
+        keyframes = self.conv_in(keyframes + self.type_emb[None, None, None, None])
+        remaining = (8, 8, 4, 2, 1)
+        for stage_index, blocks in enumerate(self.det_stages[:3]):
+            times = self._keyframe_times(pixel_frame_indices, remaining[stage_index])
+            for block in blocks:
+                hidden, keyframes = block.forward_joint(hidden, keyframes, times)
+            hidden = self.upsamples[stage_index](hidden)
+            keyframes = self._upsample_keyframes(self.upsamples[stage_index], keyframes)
+        return hidden, keyframes
+
     def _stage_4(self, hidden: mx.array, original_frames: int) -> mx.array:
         for block in self.det_stages[3]:
             hidden = block(hidden)
         hidden = self.upsamples[3](hidden)
         return hidden[:, : max(original_frames, self.stage_kernels[-1][0])]
+
+    def _stage_4_joint(
+        self,
+        hidden: mx.array,
+        keyframes: mx.array,
+        pixel_frame_indices: mx.array,
+        original_frames: int,
+    ) -> tuple[mx.array, mx.array]:
+        times = self._keyframe_times(pixel_frame_indices, 2)
+        for block in self.det_stages[3]:
+            hidden, keyframes = block.forward_joint(hidden, keyframes, times)
+        hidden = self.upsamples[3](hidden)
+        keyframes = self._upsample_keyframes(self.upsamples[3], keyframes)
+        return (
+            hidden[:, : max(original_frames, self.stage_kernels[-1][0])],
+            keyframes,
+        )
 
     def _diffuse(self, context: mx.array, pixels: mx.array) -> mx.array:
         batch = context.shape[0]
@@ -230,6 +320,32 @@ class DiffusionVideoDecoder(nn.Module):
         modulation = self.shared_adaln(embedding)
         for block in self.diff_blocks:
             hidden = block(context, hidden, modulation)
+        output = self.conv_out(self.norm_out(hidden))
+        return unpatchify_pixels(output, self.patch_size, self.out_channels)
+
+    def _diffuse_joint(
+        self,
+        context: mx.array,
+        pixels: mx.array,
+        keyframe_context: mx.array,
+        keyframe_pixels: mx.array,
+        keyframe_times: mx.array,
+    ) -> mx.array:
+        batch = context.shape[0]
+        hidden = self.conv_in_x_t(patchify_pixels(pixels, self.patch_size))
+        keyframes = self.conv_in_x_t(patchify_pixels(keyframe_pixels, self.patch_size))
+        timestep = mx.ones((batch,), dtype=mx.float32)
+        embedding = self.t_embedder(timestep * self.timestep_scale_multiplier)
+        modulation = self.shared_adaln(embedding)
+        for block in self.diff_blocks:
+            hidden, keyframes = block.forward_joint(
+                context,
+                hidden,
+                keyframe_context,
+                keyframes,
+                modulation,
+                keyframe_times,
+            )
         output = self.conv_out(self.norm_out(hidden))
         return unpatchify_pixels(output, self.patch_size, self.out_channels)
 
@@ -255,10 +371,34 @@ class DiffusionVideoDecoder(nn.Module):
         return halo_h, halo_w
 
     def __call__(
-        self, latent: mx.array, *, seed: int = 0, spatial_tiles: int = 1
+        self,
+        latent: mx.array,
+        *,
+        seed: int = 0,
+        spatial_tiles: int = 1,
+        keyframe_latents: mx.array | None = None,
+        keyframe_positions: list[int] | None = None,
     ) -> mx.array:
         output_frames = 8 * (latent.shape[2] - 1) + 1
-        stage4_input = self._stages_1_to_3(latent)
+        use_keyframes = keyframe_latents is not None
+        if use_keyframes:
+            if (
+                not keyframe_positions
+                or len(keyframe_positions) != keyframe_latents.shape[2]
+            ):
+                raise ValueError(
+                    "keyframe positions must match the keyframe latent planes"
+                )
+            if spatial_tiles != 1:
+                raise ValueError("keyframe-aware DiffVAE tiling is not implemented yet")
+            positions = mx.array(keyframe_positions, dtype=mx.int32)
+            stage4_input, keyframe_input = self._stages_1_to_3_joint(
+                latent, keyframe_latents, positions
+            )
+        else:
+            positions = None
+            keyframe_input = None
+            stage4_input = self._stages_1_to_3(latent)
         canvas_frames = max(output_frames, self.stage_kernels[-1][0])
         pixel_scale_h = self.upsamples[3].stride[1] * self.patch_size
         pixel_scale_w = self.upsamples[3].stride[2] * self.patch_size
@@ -276,6 +416,30 @@ class DiffusionVideoDecoder(nn.Module):
         mx.eval(stage4_input, full_noise)
 
         if spatial_tiles == 1:
+            if use_keyframes:
+                context, keyframe_context = self._stage_4_joint(
+                    stage4_input,
+                    keyframe_input,
+                    positions,
+                    output_frames,
+                )
+                keyframe_noise = mx.random.normal(
+                    (
+                        latent.shape[0],
+                        self.out_channels,
+                        keyframe_latents.shape[2],
+                        context.shape[2] * self.patch_size,
+                        context.shape[3] * self.patch_size,
+                    ),
+                    dtype=context.dtype,
+                )
+                return self._diffuse_joint(
+                    context,
+                    full_noise,
+                    keyframe_context,
+                    keyframe_noise,
+                    self._keyframe_times(positions, 1),
+                )[:, :, :output_frames]
             context = self._stage_4(stage4_input, output_frames)
             return self._diffuse(context, full_noise)[:, :, :output_frames]
 
