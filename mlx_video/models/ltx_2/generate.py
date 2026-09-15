@@ -1831,6 +1831,7 @@ def generate_video(
     prompt_enhancer_repo: str = LTX25_PROMPT_ENHANCER_REPO,
     detailing_lora: Optional[str] = None,
     detailing_lora_strength: float = 0.5,
+    video_decoder: str = "conv",
 ):
     """Generate video using LTX-2 models.
 
@@ -1917,6 +1918,8 @@ def generate_video(
         raise ValueError("The initial DFR path currently supports T2V only")
     if pipeline is PipelineType.DFR and stream:
         raise ValueError("DFR does not support streaming while its canvas is padded")
+    if video_decoder == "diffusion" and stream:
+        raise ValueError("Diffusion video VAE streaming is not implemented yet")
     if pipeline is PipelineType.DFR and detailing_lora_strength < 0:
         raise ValueError("detailing_lora_strength must be non-negative")
     mode_str = "I2V" if is_i2v else "T2V"
@@ -1967,7 +1970,9 @@ def generate_video(
     # Get model path
     ltx25_patterns = None
     if model_repo.rstrip("/") == LTX25_MODEL_REPO:
-        ltx25_patterns = LTX25_REQUIRED_FILES
+        ltx25_patterns = list(LTX25_REQUIRED_FILES)
+        if video_decoder == "diffusion":
+            ltx25_patterns.append("vae/ltx-2.5-video-vae-bf16.safetensors")
     model_path = get_model_path(model_repo, allow_patterns=ltx25_patterns)
     is_ltx25_split = (model_path / "diffusion_models").is_dir()
     if pipeline is PipelineType.DFR and not is_ltx25_split:
@@ -1989,6 +1994,9 @@ def generate_video(
         audio_vae_files = sorted(
             (model_path / "vae").glob("*audio-vae-bf16.safetensors")
         )
+        diffusion_vae_files = sorted(
+            (model_path / "vae").glob("*video-vae-bf16.safetensors")
+        )
         if (
             not transformer_files
             or not text_encoder_files
@@ -2003,6 +2011,14 @@ def generate_video(
         text_encoder_path = text_encoder_files[0]
         video_vae_path = conv_vae_files[0]
         audio_vae_path = audio_vae_files[0]
+        diffusion_vae_path = (
+            diffusion_vae_files[0] if diffusion_vae_files else None
+        )
+        if video_decoder == "diffusion" and diffusion_vae_path is None:
+            raise FileNotFoundError(
+                "--video-decoder diffusion requires "
+                "vae/ltx-2.5-video-vae-bf16.safetensors"
+            )
     else:
         transformer_path = model_path / "transformer"
         text_encoder_path = (
@@ -2012,6 +2028,9 @@ def generate_video(
         )
         video_vae_path = model_path / "vae"
         audio_vae_path = None
+        diffusion_vae_path = None
+        if video_decoder == "diffusion":
+            raise ValueError("Diffusion video VAE requires LTX-2.5 split checkpoints")
 
     # Resolve spatial upscaler path for two-stage pipelines
     upscaler_path = None
@@ -3324,7 +3343,7 @@ def generate_video(
 
     console.print("\n[blue]🎞️  Decoding video...[/]")
 
-    # Select tiling configuration
+    # Select convolutional-VAE tiling configuration
     if tiling == "none":
         tiling_config = None
     elif tiling == "auto":
@@ -3381,7 +3400,15 @@ def generate_video(
     else:
         on_frames_ready = None
 
-    if tiling_config is not None:
+    if video_decoder == "diffusion":
+        from mlx_video.models.ltx_2.diffusion_vae import DiffusionVideoDecoder
+
+        del vae_decoder
+        mx.clear_cache()
+        console.print("[dim]  Decoder: diffusion VAE Metal prototype[/]")
+        vae_decoder = DiffusionVideoDecoder.from_pretrained(diffusion_vae_path)
+        video = vae_decoder(latents, seed=seed)
+    elif tiling_config is not None:
         spatial_info = (
             f"{tiling_config.spatial_config.tile_size_in_pixels}px"
             if tiling_config.spatial_config
@@ -3814,6 +3841,12 @@ Examples:
         default=0.5,
         help="DFR detailing IC-LoRA merge strength (default 0.5)",
     )
+    parser.add_argument(
+        "--video-decoder",
+        choices=["conv", "diffusion"],
+        default="conv",
+        help="LTX-2.5 video decoder: conv (default) or experimental diffusion",
+    )
     args = parser.parse_args()
 
     pipeline_map = {
@@ -3873,6 +3906,7 @@ Examples:
         prompt_enhancer_repo=args.prompt_enhancer_repo,
         detailing_lora=args.detailing_lora,
         detailing_lora_strength=args.detailing_lora_strength,
+        video_decoder=args.video_decoder,
     )
 
 

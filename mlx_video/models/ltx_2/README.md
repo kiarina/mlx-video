@@ -4,8 +4,9 @@ MLX port of [LTX-2](https://huggingface.co/Lightricks/LTX-2), a 19B parameter vi
 
 LTX-2.5 distilled text-to-video and image-to-video are also supported using the
 official split checkpoints. Accept the model terms on Hugging Face before the
-first download. The initial LTX-2.5 path uses the lighter convolutional video
-VAE; diffusion-VAE decoding is not yet supported. Audio-to-video and
+first download. The lighter convolutional video VAE is the default, and the
+experimental diffusion video VAE is available with a fused MLX Metal
+neighborhood-attention kernel. Audio-to-video and
 synchronized audio-video generation use the split LTX-2.5 audio VAE and vocoder.
 
 ## Pipelines
@@ -108,6 +109,26 @@ DFR may pad its internal canvas to a 24- or 32-frame segment boundary and trims
 the decoded result back to the requested frame count. Image conditioning,
 A2V, temporal upscaling, streaming, and diffusion-VAE decoding are not yet
 supported by this initial path.
+
+### Diffusion video VAE
+
+Use the LTX-2.5 diffusion decoder instead of the default convolutional decoder:
+
+```bash
+uv run mlx_video.generate --model-repo Lightricks/LTX-2.5 \
+    --prompt "A red fox walking through sunlit grass, detailed fur" \
+    --num-frames 121 --width 768 --height 512 \
+    --video-decoder diffusion
+```
+
+The decoder loads `vae/ltx-2.5-video-vae-bf16.safetensors` and uses a fused
+inference-only Metal kernel for 3D neighborhood attention. The kernel performs
+online softmax without materializing the neighborhood score tensor and has a
+SIMD-group specialization for the model's head dimension of 64.
+
+This initial decoder runs without spatial or temporal tiling and does not yet
+pass DFR generated keyframes into the decoder. The convolutional decoder
+remains the default lower-memory path.
 
 ### Image-to-Video (I2V)
 
@@ -225,6 +246,7 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | `--spatial-upscaler` | auto (x2) | Spatial upscaler file for two-stage pipelines (see below) |
 | `--detailing-lora` | official LTX-2.5 adapter | DFR detailing IC-LoRA path or repository |
 | `--detailing-lora-strength` | `0.5` | DFR detailing IC-LoRA merge strength |
+| `--video-decoder` | `conv` | LTX-2.5 decoder: `conv` or experimental `diffusion` |
 
 ### Spatial Upscalers (LTX-2.3)
 

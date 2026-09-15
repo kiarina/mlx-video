@@ -27,6 +27,7 @@ uv pip install git+https://github.com/Blaizzy/mlx-video.git
 - Audio-Video joint generation
 - Prompt-driven multishot generation
 - LTX-2.5 Diffusion Fidelity Rendering (DFR) with generated keyframes
+- Experimental LTX-2.5 diffusion video VAE with fused Metal attention
 - Multi-pipeline: distilled, dev, dev-two-stage, dev-two-stage-hq
 - 2x spatial upscaling for images and videos
 - Prompt enhancement via Gemma
