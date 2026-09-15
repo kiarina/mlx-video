@@ -202,8 +202,7 @@ class DiffusionVideoDecoder(nn.Module):
         self.norm_out = nn.RMSNorm(stage5_channels, eps=1e-6)
         self.conv_out = nn.Linear(stage5_channels, pixel_channels, bias=True)
 
-    def _deterministic_context(self, latent: mx.array) -> mx.array:
-        original_frames = 8 * (latent.shape[2] - 1) + 1
+    def _stages_1_to_3(self, latent: mx.array) -> mx.array:
         latent = mx.concatenate(
             [latent, mx.repeat(latent[:, :, -1:], 2, axis=2)], axis=2
         )
@@ -211,27 +210,20 @@ class DiffusionVideoDecoder(nn.Module):
         std = self.std_of_means[None, :, None, None, None]
         hidden = latent * std + mean
         hidden = self.conv_in(mx.transpose(hidden, (0, 2, 3, 4, 1)))
-        for stage_index, blocks in enumerate(self.det_stages):
+        for stage_index, blocks in enumerate(self.det_stages[:3]):
             for block in blocks:
                 hidden = block(hidden)
             hidden = self.upsamples[stage_index](hidden)
+        return hidden
+
+    def _stage_4(self, hidden: mx.array, original_frames: int) -> mx.array:
+        for block in self.det_stages[3]:
+            hidden = block(hidden)
+        hidden = self.upsamples[3](hidden)
         return hidden[:, : max(original_frames, self.stage_kernels[-1][0])]
 
-    def __call__(self, latent: mx.array, *, seed: int = 0) -> mx.array:
-        output_frames = 8 * (latent.shape[2] - 1) + 1
-        context = self._deterministic_context(latent)
-        batch, frames, height, width, _ = context.shape
-        mx.random.seed(seed)
-        pixels = mx.random.normal(
-            (
-                batch,
-                self.out_channels,
-                frames,
-                height * self.patch_size,
-                width * self.patch_size,
-            ),
-            dtype=context.dtype,
-        )
+    def _diffuse(self, context: mx.array, pixels: mx.array) -> mx.array:
+        batch = context.shape[0]
         hidden = self.conv_in_x_t(patchify_pixels(pixels, self.patch_size))
         timestep = mx.ones((batch,), dtype=mx.float32)
         embedding = self.t_embedder(timestep * self.timestep_scale_multiplier)
@@ -239,8 +231,84 @@ class DiffusionVideoDecoder(nn.Module):
         for block in self.diff_blocks:
             hidden = block(context, hidden, modulation)
         output = self.conv_out(self.norm_out(hidden))
-        pixels = unpatchify_pixels(output, self.patch_size, self.out_channels)
-        return pixels[:, :, :output_frames]
+        return unpatchify_pixels(output, self.patch_size, self.out_channels)
+
+    @staticmethod
+    def _tile_bounds(size: int, count: int) -> list[tuple[int, int]]:
+        if count < 1 or count > size:
+            raise ValueError(f"tile count must be in [1, {size}], got {count}")
+        return [
+            (index * size // count, (index + 1) * size // count)
+            for index in range(count)
+        ]
+
+    def _spatial_halo(self) -> tuple[int, int]:
+        stride_h, stride_w = self.upsamples[3].stride[1:]
+        stage4 = self.stage_depths[3]
+        stage5 = self.stage_depths[4]
+        halo_h = stage4 * (self.stage_kernels[3][1] // 2) + math.ceil(
+            stage5 * (self.stage_kernels[4][1] // 2) / stride_h
+        )
+        halo_w = stage4 * (self.stage_kernels[3][2] // 2) + math.ceil(
+            stage5 * (self.stage_kernels[4][2] // 2) / stride_w
+        )
+        return halo_h, halo_w
+
+    def __call__(
+        self, latent: mx.array, *, seed: int = 0, spatial_tiles: int = 1
+    ) -> mx.array:
+        output_frames = 8 * (latent.shape[2] - 1) + 1
+        stage4_input = self._stages_1_to_3(latent)
+        canvas_frames = max(output_frames, self.stage_kernels[-1][0])
+        pixel_scale_h = self.upsamples[3].stride[1] * self.patch_size
+        pixel_scale_w = self.upsamples[3].stride[2] * self.patch_size
+        mx.random.seed(seed)
+        full_noise = mx.random.normal(
+            (
+                latent.shape[0],
+                self.out_channels,
+                canvas_frames,
+                stage4_input.shape[2] * pixel_scale_h,
+                stage4_input.shape[3] * pixel_scale_w,
+            ),
+            dtype=stage4_input.dtype,
+        )
+        mx.eval(stage4_input, full_noise)
+
+        if spatial_tiles == 1:
+            context = self._stage_4(stage4_input, output_frames)
+            return self._diffuse(context, full_noise)[:, :, :output_frames]
+
+        halo_h, halo_w = self._spatial_halo()
+        rows = []
+        for core_h0, core_h1 in self._tile_bounds(stage4_input.shape[2], spatial_tiles):
+            columns = []
+            input_h0 = max(0, core_h0 - halo_h)
+            input_h1 = min(stage4_input.shape[2], core_h1 + halo_h)
+            for core_w0, core_w1 in self._tile_bounds(
+                stage4_input.shape[3], spatial_tiles
+            ):
+                input_w0 = max(0, core_w0 - halo_w)
+                input_w1 = min(stage4_input.shape[3], core_w1 + halo_w)
+                feature = stage4_input[:, :, input_h0:input_h1, input_w0:input_w1]
+                context = self._stage_4(feature, output_frames)
+                noise = full_noise[
+                    :,
+                    :,
+                    :,
+                    input_h0 * pixel_scale_h : input_h1 * pixel_scale_h,
+                    input_w0 * pixel_scale_w : input_w1 * pixel_scale_w,
+                ]
+                decoded = self._diffuse(context, noise)[:, :, :output_frames]
+                mx.eval(decoded)
+                mx.clear_cache()
+                local_h0 = (core_h0 - input_h0) * pixel_scale_h
+                local_h1 = local_h0 + (core_h1 - core_h0) * pixel_scale_h
+                local_w0 = (core_w0 - input_w0) * pixel_scale_w
+                local_w1 = local_w0 + (core_w1 - core_w0) * pixel_scale_w
+                columns.append(decoded[:, :, :, local_h0:local_h1, local_w0:local_w1])
+            rows.append(mx.concatenate(columns, axis=4))
+        return mx.concatenate(rows, axis=3)
 
     @staticmethod
     def sanitize(weights: dict[str, mx.array]) -> dict[str, mx.array]:
