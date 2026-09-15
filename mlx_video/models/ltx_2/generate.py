@@ -68,6 +68,7 @@ LTX25_REQUIRED_FILES = [
     "vae/ltx-2.5-video-vae-conv-bf16.safetensors",
     "vae/ltx-2.5-audio-vae-bf16.safetensors",
     "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+    "model_patches/ltx-2.5-duration-head-bf16.safetensors",
 ]
 
 # Dev model scheduling constants
@@ -1781,7 +1782,7 @@ def generate_video(
     negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
     height: int = 512,
     width: int = 512,
-    num_frames: int = 33,
+    num_frames: int | None = None,
     num_inference_steps: int = 40,
     cfg_scale: float = 4.0,
     audio_cfg_scale: float = 7.0,
@@ -1816,6 +1817,8 @@ def generate_video(
     audio_file: Optional[str] = None,
     audio_start_time: float = 0.0,
     spatial_upscaler: Optional[str] = None,
+    auto_duration_min_seconds: float = 1.0,
+    auto_duration_max_seconds: float = 20.0,
 ):
     """Generate video using LTX-2 models.
 
@@ -1833,7 +1836,8 @@ def generate_video(
         negative_prompt: Negative prompt for CFG (dev pipeline only)
         height: Output video height (must be divisible by 32/64)
         width: Output video width (must be divisible by 32/64)
-        num_frames: Number of frames (must be 1 + 8*k)
+        num_frames: Number of frames (must be 1 + 8*k). LTX-2.5 predicts it
+            from the prompt when omitted; older models retain the default 33.
         num_inference_steps: Number of denoising steps (dev pipeline only)
         cfg_scale: Guidance scale for CFG (dev pipeline only)
         seed: Random seed for reproducibility
@@ -1859,6 +1863,12 @@ def generate_video(
     """
     start_time = time.time()
 
+    is_ltx25_requested = model_repo.rstrip("/") == LTX25_MODEL_REPO or (
+        Path(model_repo) / "diffusion_models"
+    ).is_dir()
+    if num_frames is None and not is_ltx25_requested:
+        num_frames = 33
+
     # Validate dimensions
     is_two_stage = pipeline in (
         PipelineType.DISTILLED,
@@ -1869,7 +1879,7 @@ def generate_video(
     assert height % divisor == 0, f"Height must be divisible by {divisor}, got {height}"
     assert width % divisor == 0, f"Width must be divisible by {divisor}, got {width}"
 
-    if num_frames % 8 != 1:
+    if num_frames is not None and num_frames % 8 != 1:
         adjusted_num_frames = round((num_frames - 1) / 8) * 8 + 1
         console.print(
             f"[yellow]⚠️  Number of frames must be 1 + 8*k. Using: {adjusted_num_frames}[/]"
@@ -1905,7 +1915,8 @@ def generate_video(
         PipelineType.DEV_TWO_STAGE_HQ: "DEV-TWO-STAGE-HQ",
     }
     pipeline_name = pipeline_names[pipeline]
-    header = f"[bold cyan]🎬 [{pipeline_name}] [{mode_str}] {width}x{height} • {num_frames} frames[/]"
+    frame_label = f"{num_frames} frames" if num_frames is not None else "auto duration"
+    header = f"[bold cyan]🎬 [{pipeline_name}] [{mode_str}] {width}x{height} • {frame_label}[/]"
     console.print(Panel(header, expand=False))
     console.print(f"[dim]Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}[/]")
 
@@ -1930,15 +1941,6 @@ def generate_video(
             console.print(
                 f"[dim]Last image: {end_image} (strength={end_image_strength}, frame=-1)[/]"
             )
-
-    # Always compute audio frames - PyTorch distilled pipeline unconditionally
-    # generates audio alongside video (model was trained with joint audio-video).
-    # The --audio flag only controls whether audio is decoded and saved to output.
-    audio_frames = compute_audio_frames(num_frames, fps)
-    if audio:
-        console.print(
-            f"[dim]Audio: {audio_frames} latent frames @ {AUDIO_SAMPLE_RATE}Hz[/]"
-        )
 
     # Get model path
     ltx25_patterns = None
@@ -2028,8 +2030,6 @@ def generate_video(
         stage2_w = int(stage1_w * upscaler_scale)
     else:
         latent_h, latent_w = height // 32, width // 32
-    latent_frames = 1 + (num_frames - 1) // 8
-
     mx.random.seed(seed)
 
     # Read transformer config to detect model version
@@ -2095,6 +2095,38 @@ def generate_video(
         )
         mx.eval(text_embeddings, audio_embeddings)
         model_dtype = text_embeddings.dtype
+
+    if num_frames is None:
+        duration_files = sorted(
+            (model_path / "model_patches").glob("*duration-head*.safetensors")
+        )
+        if not duration_files:
+            raise FileNotFoundError(
+                "num_frames was omitted, but no LTX-2.5 duration-head checkpoint "
+                f"was found under {model_path}"
+            )
+        from mlx_video.models.ltx_2.duration import predict_num_frames
+
+        num_frames, predicted_seconds = predict_num_frames(
+            duration_files[0],
+            text_embeddings,
+            audio_embeddings,
+            frame_rate=fps,
+            min_seconds=auto_duration_min_seconds,
+            max_seconds=auto_duration_max_seconds,
+        )
+        console.print(
+            f"[green]✓[/] Predicted duration: {predicted_seconds:.2f}s "
+            f"→ {num_frames} frames @ {fps} fps"
+        )
+
+    # LTX jointly denoises an audio stream even when it is not decoded.
+    audio_frames = compute_audio_frames(num_frames, fps)
+    latent_frames = 1 + (num_frames - 1) // 8
+    if audio:
+        console.print(
+            f"[dim]Audio: {audio_frames} latent frames @ {AUDIO_SAMPLE_RATE}Hz[/]"
+        )
 
     del text_encoder
     mx.clear_cache()
@@ -3295,7 +3327,19 @@ Examples:
         "--width", "-W", type=int, default=512, help="Output video width"
     )
     parser.add_argument(
-        "--num-frames", "-n", type=int, default=33, help="Number of frames"
+        "--num-frames",
+        "-n",
+        type=int,
+        default=None,
+        help="Number of frames. LTX-2.5 predicts it when omitted; older models use 33.",
+    )
+    parser.add_argument(
+        "--auto-duration",
+        type=float,
+        nargs=2,
+        metavar=("MIN_SECONDS", "MAX_SECONDS"),
+        default=(1.0, 20.0),
+        help="Clamp LTX-2.5 automatic duration prediction (default: 1 20)",
     )
     parser.add_argument(
         "--steps",
@@ -3540,6 +3584,8 @@ Examples:
         audio_file=args.audio_file,
         audio_start_time=args.audio_start_time,
         spatial_upscaler=args.spatial_upscaler,
+        auto_duration_min_seconds=args.auto_duration[0],
+        auto_duration_max_seconds=args.auto_duration[1],
     )
 
 
