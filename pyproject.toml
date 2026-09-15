@@ -54,6 +54,9 @@ Issues = "https://github.com/Blaizzy/mlx-video/issues"
 [tool.setuptools.packages.find]
 include = ["mlx_video*"]
 
+[tool.setuptools.package-data]
+"mlx_video.models.ltx_2" = ["prompts/*.txt"]
+
 [tool.setuptools.dynamic]
 version = {attr = "mlx_video.version.__version__"}
 
