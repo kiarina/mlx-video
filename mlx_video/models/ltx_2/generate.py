@@ -1833,6 +1833,7 @@ def generate_video(
     detailing_lora_strength: float = 0.5,
     video_decoder: str = "conv",
     diffusion_vae_spatial_tiles: int = 1,
+    diffusion_vae_temporal_tiles: int = 1,
 ):
     """Generate video using LTX-2 models.
 
@@ -3410,6 +3411,7 @@ def generate_video(
             latents,
             seed=seed,
             spatial_tiles=diffusion_vae_spatial_tiles,
+            temporal_tiles=diffusion_vae_temporal_tiles,
             keyframe_latents=dfr_slots if pipeline is PipelineType.DFR else None,
             keyframe_positions=(
                 dfr_keyframe_positions if pipeline is PipelineType.DFR else None
@@ -3858,6 +3860,12 @@ Examples:
         default=1,
         help="Tiles per spatial axis for diffusion VAE stage 4/5 (default 1)",
     )
+    parser.add_argument(
+        "--diffusion-vae-temporal-tiles",
+        type=int,
+        default=1,
+        help="Temporal tiles for diffusion VAE stage 4/5 (default 1)",
+    )
     args = parser.parse_args()
 
     pipeline_map = {
@@ -3919,6 +3927,7 @@ Examples:
         detailing_lora_strength=args.detailing_lora_strength,
         video_decoder=args.video_decoder,
         diffusion_vae_spatial_tiles=args.diffusion_vae_spatial_tiles,
+        diffusion_vae_temporal_tiles=args.diffusion_vae_temporal_tiles,
     )
 
 

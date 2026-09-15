@@ -135,8 +135,11 @@ Stage 4 and stage 5 can be spatially tiled with a receptive-field halo. For
 example, `--diffusion-vae-spatial-tiles 2` processes a 2x2 tile grid to reduce
 peak memory at the cost of repeated halo computation. The same spatial tiling
 works for DFR keyframe-aware decoding by cropping every keyframe plane to the
-video tile's halo. Temporal tiling is not yet supported. The convolutional
-decoder remains the default lower-memory path.
+video tile's halo. `--diffusion-vae-temporal-tiles 2` similarly splits the
+stage-4/5 time axis with its causal receptive-field halo and supports both
+plain and keyframe-aware decoding. Spatial and temporal tiling cannot yet be
+combined in one decode. The convolutional decoder remains the default
+lower-memory path.
 
 ### Image-to-Video (I2V)
 
@@ -256,6 +259,7 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | `--detailing-lora-strength` | `0.5` | DFR detailing IC-LoRA merge strength |
 | `--video-decoder` | `conv` | LTX-2.5 decoder: `conv` or experimental `diffusion` |
 | `--diffusion-vae-spatial-tiles` | `1` | DiffVAE stage-4/5 tiles per spatial axis |
+| `--diffusion-vae-temporal-tiles` | `1` | Number of DiffVAE stage-4/5 temporal tiles |
 
 ### Spatial Upscalers (LTX-2.3)
 

@@ -289,10 +289,16 @@ class DiffusionVideoDecoder(nn.Module):
             keyframes = self._upsample_keyframes(self.upsamples[stage_index], keyframes)
         return hidden, keyframes
 
-    def _stage_4(self, hidden: mx.array, original_frames: int) -> mx.array:
+    def _stage_4(
+        self,
+        hidden: mx.array,
+        original_frames: int,
+        *,
+        drop_leading_frame: bool = True,
+    ) -> mx.array:
         for block in self.det_stages[3]:
             hidden = block(hidden)
-        hidden = self.upsamples[3](hidden)
+        hidden = self.upsamples[3](hidden, drop_leading_frame=drop_leading_frame)
         return hidden[:, : max(original_frames, self.stage_kernels[-1][0])]
 
     def _stage_4_joint(
@@ -301,11 +307,14 @@ class DiffusionVideoDecoder(nn.Module):
         keyframes: mx.array,
         pixel_frame_indices: mx.array,
         original_frames: int,
+        *,
+        stage4_time_origin: int = 0,
+        drop_leading_frame: bool = True,
     ) -> tuple[mx.array, mx.array]:
-        times = self._keyframe_times(pixel_frame_indices, 2)
+        times = self._keyframe_times(pixel_frame_indices, 2) - stage4_time_origin
         for block in self.det_stages[3]:
             hidden, keyframes = block.forward_joint(hidden, keyframes, times)
-        hidden = self.upsamples[3](hidden)
+        hidden = self.upsamples[3](hidden, drop_leading_frame=drop_leading_frame)
         keyframes = self._upsample_keyframes(self.upsamples[3], keyframes)
         return (
             hidden[:, : max(original_frames, self.stage_kernels[-1][0])],
@@ -370,12 +379,28 @@ class DiffusionVideoDecoder(nn.Module):
         )
         return halo_h, halo_w
 
+    def _temporal_halo(self) -> int:
+        stride = self.upsamples[3].stride[0]
+        return self.stage_depths[3] * (self.stage_kernels[3][0] // 2) + math.ceil(
+            self.stage_depths[4] * (self.stage_kernels[4][0] // 2) / stride
+        )
+
+    def _stage4_content_frames(self, latent_frames: int) -> int:
+        frames = latent_frames
+        for upsampler in self.upsamples[:3]:
+            stride = upsampler.stride[0]
+            frames *= stride
+            if stride == 2:
+                frames -= 1
+        return frames
+
     def __call__(
         self,
         latent: mx.array,
         *,
         seed: int = 0,
         spatial_tiles: int = 1,
+        temporal_tiles: int = 1,
         keyframe_latents: mx.array | None = None,
         keyframe_positions: list[int] | None = None,
     ) -> mx.array:
@@ -426,6 +451,66 @@ class DiffusionVideoDecoder(nn.Module):
             mx.eval(stage4_input, keyframe_input, full_noise, full_keyframe_noise)
         else:
             mx.eval(stage4_input, full_noise)
+
+        if temporal_tiles > 1:
+            if spatial_tiles != 1:
+                raise ValueError(
+                    "spatial and temporal DiffVAE tiling cannot yet be combined"
+                )
+            content_frames = self._stage4_content_frames(latent.shape[2])
+            halo = self._temporal_halo()
+            stride = self.upsamples[3].stride[0]
+            causal_offset = 1 if stride == 2 else 0
+            parts = []
+            for core_start, core_end in self._tile_bounds(
+                content_frames, temporal_tiles
+            ):
+                input_start = max(0, core_start - halo)
+                input_end = min(content_frames, core_end + halo)
+                feature_end = (
+                    stage4_input.shape[1] if input_end == content_frames else input_end
+                )
+                feature = stage4_input[:, input_start:feature_end]
+                pixel_start = (
+                    0 if input_start == 0 else input_start * stride - causal_offset
+                )
+                pixel_end = input_end * stride - causal_offset
+                tile_frames = pixel_end - pixel_start
+                noise = full_noise[:, :, pixel_start:pixel_end]
+                is_origin = input_start == 0
+                if use_keyframes:
+                    context, keyframe_context = self._stage_4_joint(
+                        feature,
+                        keyframe_input,
+                        positions,
+                        tile_frames,
+                        stage4_time_origin=input_start,
+                        drop_leading_frame=is_origin,
+                    )
+                    decoded = self._diffuse_joint(
+                        context,
+                        noise,
+                        keyframe_context,
+                        full_keyframe_noise,
+                        self._keyframe_times(positions, 1) - pixel_start,
+                    )
+                else:
+                    context = self._stage_4(
+                        feature,
+                        tile_frames,
+                        drop_leading_frame=is_origin,
+                    )
+                    decoded = self._diffuse(context, noise)
+                mx.eval(decoded)
+                mx.clear_cache()
+                core_pixel_start = (
+                    0 if core_start == 0 else core_start * stride - causal_offset
+                )
+                core_pixel_end = core_end * stride - causal_offset
+                local_start = core_pixel_start - pixel_start
+                local_end = core_pixel_end - pixel_start
+                parts.append(decoded[:, :, local_start:local_end])
+            return mx.concatenate(parts, axis=2)[:, :, :output_frames]
 
         if spatial_tiles == 1:
             if use_keyframes:
