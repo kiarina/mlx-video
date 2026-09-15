@@ -33,6 +33,11 @@ from mlx_video.models.ltx_2.conditioning import (
     apply_conditioning,
 )
 from mlx_video.models.ltx_2.conditioning.latent import LatentState, apply_denoise_mask
+from mlx_video.models.ltx_2.dfr import (
+    create_keyframe_slot_positions,
+    denoise_dfr_tokens,
+    resolve_dfr_canvas,
+)
 from mlx_video.models.ltx_2.ltx_2 import LTXModel
 from mlx_video.models.ltx_2.transformer import Modality
 from mlx_video.models.ltx_2.upsampler import load_upsampler, upsample_latents
@@ -50,6 +55,7 @@ class PipelineType(Enum):
     """Pipeline type selector."""
 
     DISTILLED = "distilled"  # Two-stage with upsampling, fixed sigmas, no CFG
+    DFR = "dfr"  # Distilled base + generated keyframes + IC-LoRA detailing
     DEV = "dev"  # Single-stage, dynamic sigmas, CFG
     DEV_TWO_STAGE = (
         "dev-two-stage"  # Two-stage: dev (half res, CFG) + distilled LoRA (full res)
@@ -63,6 +69,7 @@ STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
 
 LTX25_MODEL_REPO = "Lightricks/LTX-2.5"
 LTX25_PROMPT_ENHANCER_REPO = "mlx-community/gemma-4-e2b-it-bf16"
+LTX25_DETAILING_LORA_REPO = "Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler"
 LTX25_REQUIRED_FILES = [
     "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
     "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
@@ -108,7 +115,7 @@ def load_and_merge_lora(
     model: LTXModel,
     lora_path: str,
     strength: float = 1.0,
-) -> None:
+) -> Path:
     """Load LoRA weights and merge them into the transformer model in-place.
 
     Supports two formats:
@@ -246,6 +253,7 @@ def load_and_merge_lora(
     del flat_weights, lora_weights
     mx.clear_cache()
     console.print(f"[green]✓[/] Merged {merged_count} LoRA pairs (strength={strength})")
+    return lora_file
 
 
 def cfg_delta(cond: mx.array, uncond: mx.array, scale: float) -> mx.array:
@@ -1821,11 +1829,14 @@ def generate_video(
     auto_duration_min_seconds: float = 1.0,
     auto_duration_max_seconds: float = 20.0,
     prompt_enhancer_repo: str = LTX25_PROMPT_ENHANCER_REPO,
+    detailing_lora: Optional[str] = None,
+    detailing_lora_strength: float = 0.5,
 ):
     """Generate video using LTX-2 models.
 
-    Supports four pipelines:
+    Supports five pipelines:
     - DISTILLED: Two-stage generation with upsampling, fixed sigma schedules, no CFG
+    - DFR: Distilled generation with generated keyframes and IC-LoRA detailing
     - DEV: Single-stage generation with dynamic sigmas and CFG
     - DEV_TWO_STAGE: Stage 1 dev (half res, CFG) + upsample + stage 2 distilled with LoRA (full res, no CFG)
     - DEV_TWO_STAGE_HQ: res_2s sampler, LoRA both stages (0.25/0.5), lower rescale
@@ -1865,15 +1876,17 @@ def generate_video(
     """
     start_time = time.time()
 
-    is_ltx25_requested = model_repo.rstrip("/") == LTX25_MODEL_REPO or (
-        Path(model_repo) / "diffusion_models"
-    ).is_dir()
+    is_ltx25_requested = (
+        model_repo.rstrip("/") == LTX25_MODEL_REPO
+        or (Path(model_repo) / "diffusion_models").is_dir()
+    )
     if num_frames is None and not is_ltx25_requested:
         num_frames = 33
 
     # Validate dimensions
     is_two_stage = pipeline in (
         PipelineType.DISTILLED,
+        PipelineType.DFR,
         PipelineType.DEV_TWO_STAGE,
         PipelineType.DEV_TWO_STAGE_HQ,
     )
@@ -1900,6 +1913,12 @@ def generate_video(
     # A2V implicitly enables audio path through the transformer
     if is_a2v:
         audio = True
+    if pipeline is PipelineType.DFR and (is_i2v or is_a2v):
+        raise ValueError("The initial DFR path currently supports T2V only")
+    if pipeline is PipelineType.DFR and stream:
+        raise ValueError("DFR does not support streaming while its canvas is padded")
+    if pipeline is PipelineType.DFR and detailing_lora_strength < 0:
+        raise ValueError("detailing_lora_strength must be non-negative")
     mode_str = "I2V" if is_i2v else "T2V"
     if has_end_image and image is not None:
         mode_str = "I2V(first+last)"
@@ -1912,6 +1931,7 @@ def generate_video(
 
     pipeline_names = {
         PipelineType.DISTILLED: "DISTILLED",
+        PipelineType.DFR: "DFR",
         PipelineType.DEV: "DEV",
         PipelineType.DEV_TWO_STAGE: "DEV-TWO-STAGE",
         PipelineType.DEV_TWO_STAGE_HQ: "DEV-TWO-STAGE-HQ",
@@ -1950,9 +1970,11 @@ def generate_video(
         ltx25_patterns = LTX25_REQUIRED_FILES
     model_path = get_model_path(model_repo, allow_patterns=ltx25_patterns)
     is_ltx25_split = (model_path / "diffusion_models").is_dir()
+    if pipeline is PipelineType.DFR and not is_ltx25_split:
+        raise ValueError("DFR requires the LTX-2.5 split checkpoint")
     if is_ltx25_split:
-        if pipeline is not PipelineType.DISTILLED:
-            raise ValueError("LTX-2.5 currently supports only the distilled pipeline")
+        if pipeline not in (PipelineType.DISTILLED, PipelineType.DFR):
+            raise ValueError("LTX-2.5 currently supports distilled and DFR pipelines")
         transformer_files = sorted(
             (model_path / "diffusion_models").glob(
                 "*distilled-transformer-bf16.safetensors"
@@ -2141,6 +2163,16 @@ def generate_video(
             f"→ {num_frames} frames @ {fps} fps"
         )
 
+    requested_num_frames = num_frames
+    dfr_keyframe_positions: list[int] = []
+    if pipeline is PipelineType.DFR:
+        num_frames, dfr_segment, dfr_keyframe_positions = resolve_dfr_canvas(num_frames)
+        if num_frames != requested_num_frames:
+            console.print(
+                f"[dim]DFR canvas padded from {requested_num_frames} to "
+                f"{num_frames} frames (segment={dfr_segment})[/]"
+            )
+
     # LTX jointly denoises an audio stream even when it is not decoded.
     audio_frames = compute_audio_frames(num_frames, fps)
     latent_frames = 1 + (num_frames - 1) // 8
@@ -2255,7 +2287,7 @@ def generate_video(
     # Pipeline-specific generation logic
     # ==========================================================================
 
-    if pipeline == PipelineType.DISTILLED:
+    if pipeline in (PipelineType.DISTILLED, PipelineType.DFR):
         # ======================================================================
         # DISTILLED PIPELINE: Two-stage with upsampling
         # ======================================================================
@@ -2267,7 +2299,8 @@ def generate_video(
         stage2_end_image_latent = None
         if is_i2v:
             with console.status(
-                "[blue]🖼️  Loading VAE encoder and encoding image(s)...[/]", spinner="dots"
+                "[blue]🖼️  Loading VAE encoder and encoding image(s)...[/]",
+                spinner="dots",
             ):
                 vae_encoder = VideoEncoder.from_pretrained(
                     video_vae_path if is_ltx25_split else video_vae_path / "encoder"
@@ -2277,19 +2310,43 @@ def generate_video(
                 s2_h, s2_w = stage2_h * 32, stage2_w * 32
 
                 if image is not None:
-                    input_image = load_image(image, height=s1_h, width=s1_w, dtype=model_dtype)
-                    stage1_image_latent = vae_encoder(prepare_image_for_encoding(input_image, s1_h, s1_w, dtype=model_dtype))
+                    input_image = load_image(
+                        image, height=s1_h, width=s1_w, dtype=model_dtype
+                    )
+                    stage1_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            input_image, s1_h, s1_w, dtype=model_dtype
+                        )
+                    )
                     mx.eval(stage1_image_latent)
-                    input_image = load_image(image, height=s2_h, width=s2_w, dtype=model_dtype)
-                    stage2_image_latent = vae_encoder(prepare_image_for_encoding(input_image, s2_h, s2_w, dtype=model_dtype))
+                    input_image = load_image(
+                        image, height=s2_h, width=s2_w, dtype=model_dtype
+                    )
+                    stage2_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            input_image, s2_h, s2_w, dtype=model_dtype
+                        )
+                    )
                     mx.eval(stage2_image_latent)
 
                 if has_end_image:
-                    end_input = load_image(end_image, height=s1_h, width=s1_w, dtype=model_dtype)
-                    stage1_end_image_latent = vae_encoder(prepare_image_for_encoding(end_input, s1_h, s1_w, dtype=model_dtype))
+                    end_input = load_image(
+                        end_image, height=s1_h, width=s1_w, dtype=model_dtype
+                    )
+                    stage1_end_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            end_input, s1_h, s1_w, dtype=model_dtype
+                        )
+                    )
                     mx.eval(stage1_end_image_latent)
-                    end_input = load_image(end_image, height=s2_h, width=s2_w, dtype=model_dtype)
-                    stage2_end_image_latent = vae_encoder(prepare_image_for_encoding(end_input, s2_h, s2_w, dtype=model_dtype))
+                    end_input = load_image(
+                        end_image, height=s2_h, width=s2_w, dtype=model_dtype
+                    )
+                    stage2_end_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            end_input, s2_h, s2_w, dtype=model_dtype
+                        )
+                    )
                     mx.eval(stage2_end_image_latent)
 
                 del vae_encoder
@@ -2298,7 +2355,7 @@ def generate_video(
 
         # Stage 1
         console.print(
-            f"\n[bold yellow]⚡ Stage 1:[/] Generating at {stage1_w*32}x{stage1_h*32} (8 steps)"
+            f"\n[bold yellow]⚡ Stage 1:[/] Generating at {stage1_w * 32}x{stage1_h * 32} (8 steps)"
         )
         mx.random.seed(seed)
 
@@ -2318,7 +2375,9 @@ def generate_video(
 
         # Apply I2V conditioning
         state1 = None
-        if is_i2v and (stage1_image_latent is not None or stage1_end_image_latent is not None):
+        if is_i2v and (
+            stage1_image_latent is not None or stage1_end_image_latent is not None
+        ):
             latent_shape = (1, 128, latent_frames, stage1_h, stage1_w)
             state1 = LatentState(
                 latent=mx.zeros(latent_shape, dtype=model_dtype),
@@ -2326,8 +2385,11 @@ def generate_video(
                 denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
             )
             conditionings = _build_i2v_conditionings(
-                stage1_image_latent, image_frame_idx, image_strength,
-                stage1_end_image_latent, end_image_strength,
+                stage1_image_latent,
+                image_frame_idx,
+                image_strength,
+                stage1_end_image_latent,
+                end_image_strength,
             )
             state1 = apply_conditioning(state1, conditionings)
 
@@ -2348,21 +2410,50 @@ def generate_video(
             )
             mx.eval(latents)
 
-        latents, audio_latents = denoise_distilled(
-            latents,
-            positions,
-            text_embeddings,
-            transformer,
-            STAGE_1_SIGMAS,
-            verbose=verbose,
-            state=state1,
-            audio_latents=audio_latents,
-            audio_positions=audio_positions,
-            audio_embeddings=audio_embeddings,
-            audio_frozen=is_a2v,
-            ancestral=is_ltx25_split,
-            noise_seed=seed + 10000,
-        )
+        dfr_slots = None
+        if pipeline is PipelineType.DFR:
+            dfr_slot_positions = create_keyframe_slot_positions(
+                dfr_keyframe_positions,
+                height=stage1_h,
+                width=stage1_w,
+                fps=fps,
+            )
+            dfr_slots = mx.random.normal(
+                (1, 128, len(dfr_keyframe_positions), stage1_h, stage1_w),
+                dtype=model_dtype,
+            )
+            latents, dfr_slots, audio_latents = denoise_dfr_tokens(
+                latents,
+                dfr_slots,
+                positions,
+                dfr_slot_positions,
+                text_embeddings,
+                transformer,
+                STAGE_1_SIGMAS,
+                audio_latents=audio_latents,
+                audio_positions=audio_positions,
+                audio_embeddings=audio_embeddings,
+                ancestral=True,
+                noise_seed=seed + 10000,
+            )
+        else:
+            latents, audio_latents = denoise_distilled(
+                latents,
+                positions,
+                text_embeddings,
+                transformer,
+                STAGE_1_SIGMAS,
+                verbose=verbose,
+                state=state1,
+                audio_latents=audio_latents,
+                audio_positions=audio_positions,
+                audio_embeddings=audio_embeddings,
+                audio_frozen=is_a2v,
+                ancestral=is_ltx25_split,
+                noise_seed=seed + 10000,
+            )
+
+        dfr_reference = latents if pipeline is PipelineType.DFR else None
 
         # Upsample latents
         with console.status(
@@ -2384,6 +2475,14 @@ def generate_video(
                 vae_decoder.per_channel_statistics.std,
             )
             mx.eval(latents)
+            if dfr_slots is not None:
+                dfr_slots = upsample_latents(
+                    dfr_slots,
+                    upsampler,
+                    vae_decoder.per_channel_statistics.mean,
+                    vae_decoder.per_channel_statistics.std,
+                )
+                mx.eval(dfr_slots)
 
             del upsampler
             mx.clear_cache()
@@ -2391,21 +2490,26 @@ def generate_video(
 
         # Stage 2
         console.print(
-            f"\n[bold yellow]⚡ Stage 2:[/] Refining at {stage2_w*32}x{stage2_h*32} (3 steps)"
+            f"\n[bold yellow]⚡ Stage 2:[/] Refining at {stage2_w * 32}x{stage2_h * 32} (3 steps)"
         )
         positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
         mx.eval(positions)
 
         state2 = None
-        if is_i2v and (stage2_image_latent is not None or stage2_end_image_latent is not None):
+        if is_i2v and (
+            stage2_image_latent is not None or stage2_end_image_latent is not None
+        ):
             state2 = LatentState(
                 latent=latents,
                 clean_latent=mx.zeros_like(latents),
                 denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
             )
             conditionings = _build_i2v_conditionings(
-                stage2_image_latent, image_frame_idx, image_strength,
-                stage2_end_image_latent, end_image_strength,
+                stage2_image_latent,
+                image_frame_idx,
+                image_strength,
+                stage2_end_image_latent,
+                end_image_strength,
             )
             state2 = apply_conditioning(state2, conditionings)
 
@@ -2426,6 +2530,10 @@ def generate_video(
             noise = mx.random.normal(latents.shape).astype(model_dtype)
             latents = noise * noise_scale + latents * one_minus_scale
             mx.eval(latents)
+            if dfr_slots is not None:
+                slot_noise = mx.random.normal(dfr_slots.shape).astype(model_dtype)
+                dfr_slots = slot_noise * noise_scale + dfr_slots * one_minus_scale
+                mx.eval(dfr_slots)
 
         # Re-noise audio at sigma=0.909375 for joint refinement (matches PyTorch)
         if audio_latents is not None and not is_a2v:
@@ -2437,19 +2545,61 @@ def generate_video(
             mx.eval(audio_latents)
 
         # Joint video + audio refinement (no CFG, positive embeddings only)
-        latents, audio_latents = denoise_distilled(
-            latents,
-            positions,
-            text_embeddings,
-            transformer,
-            STAGE_2_SIGMAS,
-            verbose=verbose,
-            state=state2,
-            audio_latents=audio_latents,
-            audio_positions=audio_positions,
-            audio_embeddings=audio_embeddings,
-            audio_frozen=is_a2v,
-        )
+        if pipeline is PipelineType.DFR:
+            detail_path = detailing_lora or LTX25_DETAILING_LORA_REPO
+            detail_file = load_and_merge_lora(
+                transformer, detail_path, strength=detailing_lora_strength
+            )
+            from safetensors import safe_open
+
+            with safe_open(detail_file, framework="numpy") as file:
+                detail_metadata = file.metadata() or {}
+            reference_downscale = int(
+                detail_metadata.get("reference_downscale_factor", 1)
+            )
+            dfr_slot_positions = create_keyframe_slot_positions(
+                dfr_keyframe_positions,
+                height=stage2_h,
+                width=stage2_w,
+                fps=fps,
+            )
+            reference_positions = create_position_grid(
+                1,
+                latent_frames,
+                stage1_h,
+                stage1_w,
+                spatial_scale=32 * reference_downscale,
+                fps=fps,
+            )
+            latents, dfr_slots, audio_latents = denoise_dfr_tokens(
+                latents,
+                dfr_slots,
+                positions,
+                dfr_slot_positions,
+                text_embeddings,
+                transformer,
+                STAGE_2_SIGMAS,
+                audio_latents=audio_latents,
+                audio_positions=audio_positions,
+                audio_embeddings=audio_embeddings,
+                reference_latents=dfr_reference,
+                reference_positions=reference_positions,
+                noise_seed=seed + 20000,
+            )
+        else:
+            latents, audio_latents = denoise_distilled(
+                latents,
+                positions,
+                text_embeddings,
+                transformer,
+                STAGE_2_SIGMAS,
+                verbose=verbose,
+                state=state2,
+                audio_latents=audio_latents,
+                audio_positions=audio_positions,
+                audio_embeddings=audio_embeddings,
+                audio_frozen=is_a2v,
+            )
 
     elif pipeline == PipelineType.DEV:
         # ======================================================================
@@ -2461,20 +2611,33 @@ def generate_video(
         end_image_latent = None
         if is_i2v:
             with console.status(
-                "[blue]🖼️  Loading VAE encoder and encoding image(s)...[/]", spinner="dots"
+                "[blue]🖼️  Loading VAE encoder and encoding image(s)...[/]",
+                spinner="dots",
             ):
                 vae_encoder = VideoEncoder.from_pretrained(
                     video_vae_path if is_ltx25_split else video_vae_path / "encoder"
                 )
 
                 if image is not None:
-                    input_image = load_image(image, height=height, width=width, dtype=model_dtype)
-                    image_latent = vae_encoder(prepare_image_for_encoding(input_image, height, width, dtype=model_dtype))
+                    input_image = load_image(
+                        image, height=height, width=width, dtype=model_dtype
+                    )
+                    image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            input_image, height, width, dtype=model_dtype
+                        )
+                    )
                     mx.eval(image_latent)
 
                 if has_end_image:
-                    end_input = load_image(end_image, height=height, width=width, dtype=model_dtype)
-                    end_image_latent = vae_encoder(prepare_image_for_encoding(end_input, height, width, dtype=model_dtype))
+                    end_input = load_image(
+                        end_image, height=height, width=width, dtype=model_dtype
+                    )
+                    end_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            end_input, height, width, dtype=model_dtype
+                        )
+                    )
                     mx.eval(end_image_latent)
 
                 del vae_encoder
@@ -2518,8 +2681,11 @@ def generate_video(
                 denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
             )
             conditionings = _build_i2v_conditionings(
-                image_latent, image_frame_idx, image_strength,
-                end_image_latent, end_image_strength,
+                image_latent,
+                image_frame_idx,
+                image_strength,
+                end_image_latent,
+                end_image_strength,
             )
             video_state = apply_conditioning(video_state, conditionings)
 
@@ -2585,7 +2751,8 @@ def generate_video(
         stage2_end_image_latent = None
         if is_i2v:
             with console.status(
-                "[blue]🖼️  Loading VAE encoder and encoding image(s)...[/]", spinner="dots"
+                "[blue]🖼️  Loading VAE encoder and encoding image(s)...[/]",
+                spinner="dots",
             ):
                 vae_encoder = VideoEncoder.from_pretrained(
                     video_vae_path if is_ltx25_split else video_vae_path / "encoder"
@@ -2595,19 +2762,43 @@ def generate_video(
                 s2_h, s2_w = stage2_h * 32, stage2_w * 32
 
                 if image is not None:
-                    input_image = load_image(image, height=s1_h, width=s1_w, dtype=model_dtype)
-                    stage1_image_latent = vae_encoder(prepare_image_for_encoding(input_image, s1_h, s1_w, dtype=model_dtype))
+                    input_image = load_image(
+                        image, height=s1_h, width=s1_w, dtype=model_dtype
+                    )
+                    stage1_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            input_image, s1_h, s1_w, dtype=model_dtype
+                        )
+                    )
                     mx.eval(stage1_image_latent)
-                    input_image = load_image(image, height=s2_h, width=s2_w, dtype=model_dtype)
-                    stage2_image_latent = vae_encoder(prepare_image_for_encoding(input_image, s2_h, s2_w, dtype=model_dtype))
+                    input_image = load_image(
+                        image, height=s2_h, width=s2_w, dtype=model_dtype
+                    )
+                    stage2_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            input_image, s2_h, s2_w, dtype=model_dtype
+                        )
+                    )
                     mx.eval(stage2_image_latent)
 
                 if has_end_image:
-                    end_input = load_image(end_image, height=s1_h, width=s1_w, dtype=model_dtype)
-                    stage1_end_image_latent = vae_encoder(prepare_image_for_encoding(end_input, s1_h, s1_w, dtype=model_dtype))
+                    end_input = load_image(
+                        end_image, height=s1_h, width=s1_w, dtype=model_dtype
+                    )
+                    stage1_end_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            end_input, s1_h, s1_w, dtype=model_dtype
+                        )
+                    )
                     mx.eval(stage1_end_image_latent)
-                    end_input = load_image(end_image, height=s2_h, width=s2_w, dtype=model_dtype)
-                    stage2_end_image_latent = vae_encoder(prepare_image_for_encoding(end_input, s2_h, s2_w, dtype=model_dtype))
+                    end_input = load_image(
+                        end_image, height=s2_h, width=s2_w, dtype=model_dtype
+                    )
+                    stage2_end_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            end_input, s2_h, s2_w, dtype=model_dtype
+                        )
+                    )
                     mx.eval(stage2_end_image_latent)
 
                 del vae_encoder
@@ -2622,7 +2813,7 @@ def generate_video(
         )
 
         console.print(
-            f"\n[bold yellow]⚡ Stage 1:[/] Dev generating at {stage1_w*32}x{stage1_h*32} ({num_inference_steps} steps, CFG={cfg_scale}, rescale={cfg_rescale})"
+            f"\n[bold yellow]⚡ Stage 1:[/] Dev generating at {stage1_w * 32}x{stage1_h * 32} ({num_inference_steps} steps, CFG={cfg_scale}, rescale={cfg_rescale})"
         )
         mx.random.seed(seed)
 
@@ -2644,15 +2835,20 @@ def generate_video(
         # Apply I2V conditioning for stage 1
         state1 = None
         stage1_shape = (1, 128, latent_frames, stage1_h, stage1_w)
-        if is_i2v and (stage1_image_latent is not None or stage1_end_image_latent is not None):
+        if is_i2v and (
+            stage1_image_latent is not None or stage1_end_image_latent is not None
+        ):
             state1 = LatentState(
                 latent=mx.zeros(stage1_shape, dtype=model_dtype),
                 clean_latent=mx.zeros(stage1_shape, dtype=model_dtype),
                 denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
             )
             conditionings = _build_i2v_conditionings(
-                stage1_image_latent, image_frame_idx, image_strength,
-                stage1_end_image_latent, end_image_strength,
+                stage1_image_latent,
+                image_frame_idx,
+                image_strength,
+                stage1_end_image_latent,
+                end_image_strength,
             )
             state1 = apply_conditioning(state1, conditionings)
 
@@ -2753,15 +2949,20 @@ def generate_video(
         mx.eval(positions)
 
         state2 = None
-        if is_i2v and (stage2_image_latent is not None or stage2_end_image_latent is not None):
+        if is_i2v and (
+            stage2_image_latent is not None or stage2_end_image_latent is not None
+        ):
             state2 = LatentState(
                 latent=latents,
                 clean_latent=mx.zeros_like(latents),
                 denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
             )
             conditionings = _build_i2v_conditionings(
-                stage2_image_latent, image_frame_idx, image_strength,
-                stage2_end_image_latent, end_image_strength,
+                stage2_image_latent,
+                image_frame_idx,
+                image_strength,
+                stage2_end_image_latent,
+                end_image_strength,
             )
             state2 = apply_conditioning(state2, conditionings)
 
@@ -2849,19 +3050,43 @@ def generate_video(
                 s2_h, s2_w = stage2_h * 32, stage2_w * 32
 
                 if image is not None:
-                    input_image = load_image(image, height=s1_h, width=s1_w, dtype=model_dtype)
-                    stage1_image_latent = vae_encoder(prepare_image_for_encoding(input_image, s1_h, s1_w, dtype=model_dtype))
+                    input_image = load_image(
+                        image, height=s1_h, width=s1_w, dtype=model_dtype
+                    )
+                    stage1_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            input_image, s1_h, s1_w, dtype=model_dtype
+                        )
+                    )
                     mx.eval(stage1_image_latent)
-                    input_image = load_image(image, height=s2_h, width=s2_w, dtype=model_dtype)
-                    stage2_image_latent = vae_encoder(prepare_image_for_encoding(input_image, s2_h, s2_w, dtype=model_dtype))
+                    input_image = load_image(
+                        image, height=s2_h, width=s2_w, dtype=model_dtype
+                    )
+                    stage2_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            input_image, s2_h, s2_w, dtype=model_dtype
+                        )
+                    )
                     mx.eval(stage2_image_latent)
 
                 if has_end_image:
-                    end_input = load_image(end_image, height=s1_h, width=s1_w, dtype=model_dtype)
-                    stage1_end_image_latent = vae_encoder(prepare_image_for_encoding(end_input, s1_h, s1_w, dtype=model_dtype))
+                    end_input = load_image(
+                        end_image, height=s1_h, width=s1_w, dtype=model_dtype
+                    )
+                    stage1_end_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            end_input, s1_h, s1_w, dtype=model_dtype
+                        )
+                    )
                     mx.eval(stage1_end_image_latent)
-                    end_input = load_image(end_image, height=s2_h, width=s2_w, dtype=model_dtype)
-                    stage2_end_image_latent = vae_encoder(prepare_image_for_encoding(end_input, s2_h, s2_w, dtype=model_dtype))
+                    end_input = load_image(
+                        end_image, height=s2_h, width=s2_w, dtype=model_dtype
+                    )
+                    stage2_end_image_latent = vae_encoder(
+                        prepare_image_for_encoding(
+                            end_input, s2_h, s2_w, dtype=model_dtype
+                        )
+                    )
                     mx.eval(stage2_end_image_latent)
 
                 del vae_encoder
@@ -2898,7 +3123,7 @@ def generate_video(
         )
 
         console.print(
-            f"\n[bold yellow]Stage 1:[/] res_2s at {stage1_w*32}x{stage1_h*32} ({hq_steps} steps, CFG={cfg_scale}, rescale={hq_cfg_rescale})"
+            f"\n[bold yellow]Stage 1:[/] res_2s at {stage1_w * 32}x{stage1_h * 32} ({hq_steps} steps, CFG={cfg_scale}, rescale={hq_cfg_rescale})"
         )
         mx.random.seed(seed)
 
@@ -2919,15 +3144,20 @@ def generate_video(
         # Apply I2V conditioning for stage 1
         state1 = None
         stage1_shape = (1, 128, latent_frames, stage1_h, stage1_w)
-        if is_i2v and (stage1_image_latent is not None or stage1_end_image_latent is not None):
+        if is_i2v and (
+            stage1_image_latent is not None or stage1_end_image_latent is not None
+        ):
             state1 = LatentState(
                 latent=mx.zeros(stage1_shape, dtype=model_dtype),
                 clean_latent=mx.zeros(stage1_shape, dtype=model_dtype),
                 denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
             )
             conditionings = _build_i2v_conditionings(
-                stage1_image_latent, image_frame_idx, image_strength,
-                stage1_end_image_latent, end_image_strength,
+                stage1_image_latent,
+                image_frame_idx,
+                image_strength,
+                stage1_end_image_latent,
+                end_image_strength,
             )
             state1 = apply_conditioning(state1, conditionings)
 
@@ -3013,21 +3243,26 @@ def generate_video(
 
         # Stage 2: res_2s refinement at full resolution (no CFG)
         console.print(
-            f"\n[bold yellow]Stage 2:[/] res_2s refining at {stage2_w*32}x{stage2_h*32} (3 steps, no CFG)"
+            f"\n[bold yellow]Stage 2:[/] res_2s refining at {stage2_w * 32}x{stage2_h * 32} (3 steps, no CFG)"
         )
         positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
         mx.eval(positions)
 
         state2 = None
-        if is_i2v and (stage2_image_latent is not None or stage2_end_image_latent is not None):
+        if is_i2v and (
+            stage2_image_latent is not None or stage2_end_image_latent is not None
+        ):
             state2 = LatentState(
                 latent=latents,
                 clean_latent=mx.zeros_like(latents),
                 denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
             )
             conditionings = _build_i2v_conditionings(
-                stage2_image_latent, image_frame_idx, image_strength,
-                stage2_end_image_latent, end_image_strength,
+                stage2_image_latent,
+                image_frame_idx,
+                image_strength,
+                stage2_end_image_latent,
+                end_image_strength,
             )
             state2 = apply_conditioning(state2, conditionings)
 
@@ -3184,12 +3419,15 @@ def generate_video(
         video = mx.clip((video + 1.0) / 2.0, 0.0, 1.0)
         video = (video * 255).astype(mx.uint8)
         video_np = np.array(video)
+
     else:
         video = mx.squeeze(video, axis=0)
         video = mx.transpose(video, (1, 2, 3, 0))
         video = mx.clip((video + 1.0) / 2.0, 0.0, 1.0)
         video = (video * 255).astype(mx.uint8)
         video_np = np.array(video)
+        if pipeline is PipelineType.DFR and len(video_np) > requested_num_frames:
+            video_np = video_np[:requested_num_frames]
 
         if audio:
             temp_video_path = output_path.with_suffix(".temp.mp4")
@@ -3250,6 +3488,12 @@ def generate_video(
                 mx.clear_cache()
             console.print("[green]✓[/] Audio decoded")
 
+        if pipeline is PipelineType.DFR and num_frames != requested_num_frames:
+            requested_samples = round(
+                requested_num_frames / fps * vocoder_sample_rate
+            )
+            audio_np = audio_np[..., :requested_samples]
+
         audio_path = (
             Path(output_audio_path)
             if output_audio_path
@@ -3283,8 +3527,8 @@ def generate_video(
     time_str = f"{int(minutes)}m {seconds:.1f}s" if minutes >= 1 else f"{seconds:.1f}s"
     console.print(
         Panel(
-            f"[bold green]🎉 Done![/] Generated in {time_str} ({elapsed/num_frames:.2f}s/frame)\n"
-            f"[bold green]✨ Peak memory:[/] {mx.get_peak_memory() / (1024 ** 3):.2f}GB",
+            f"[bold green]🎉 Done![/] Generated in {time_str} ({elapsed / requested_num_frames:.2f}s/frame)\n"
+            f"[bold green]✨ Peak memory:[/] {mx.get_peak_memory() / (1024**3):.2f}GB",
             expand=False,
         )
     )
@@ -3332,8 +3576,8 @@ Examples:
         "--pipeline",
         type=str,
         default="distilled",
-        choices=["distilled", "dev", "dev-two-stage", "dev-two-stage-hq"],
-        help="Pipeline type: distilled (fast), dev (CFG), dev-two-stage (dev + LoRA), dev-two-stage-hq (res_2s + LoRA both stages)",
+        choices=["distilled", "dfr", "dev", "dev-two-stage", "dev-two-stage-hq"],
+        help="Pipeline type: distilled (fast), dfr (LTX-2.5 detailing), dev (CFG), dev-two-stage (dev + LoRA), dev-two-stage-hq (res_2s + LoRA both stages)",
     )
     parser.add_argument(
         "--negative-prompt",
@@ -3558,10 +3802,23 @@ Examples:
         help="Spatial upscaler filename (e.g. ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors). "
         "Auto-detects x2 by default. Use this to select x1.5 or a specific version.",
     )
+    parser.add_argument(
+        "--detailing-lora",
+        type=str,
+        default=None,
+        help="DFR detailing IC-LoRA path or repo (defaults to the official LTX-2.5 adapter)",
+    )
+    parser.add_argument(
+        "--detailing-lora-strength",
+        type=float,
+        default=0.5,
+        help="DFR detailing IC-LoRA merge strength (default 0.5)",
+    )
     args = parser.parse_args()
 
     pipeline_map = {
         "distilled": PipelineType.DISTILLED,
+        "dfr": PipelineType.DFR,
         "dev": PipelineType.DEV,
         "dev-two-stage": PipelineType.DEV_TWO_STAGE,
         "dev-two-stage-hq": PipelineType.DEV_TWO_STAGE_HQ,
@@ -3614,6 +3871,8 @@ Examples:
         auto_duration_min_seconds=args.auto_duration[0],
         auto_duration_max_seconds=args.auto_duration[1],
         prompt_enhancer_repo=args.prompt_enhancer_repo,
+        detailing_lora=args.detailing_lora,
+        detailing_lora_strength=args.detailing_lora_strength,
     )
 
 

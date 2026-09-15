@@ -26,6 +26,7 @@ uv pip install git+https://github.com/Blaizzy/mlx-video.git
 - Text-to-Video (T2V), Image-to-Video (I2V), Audio-to-Video (A2V)
 - Audio-Video joint generation
 - Prompt-driven multishot generation
+- LTX-2.5 Diffusion Fidelity Rendering (DFR) with generated keyframes
 - Multi-pipeline: distilled, dev, dev-two-stage, dev-two-stage-hq
 - 2x spatial upscaling for images and videos
 - Prompt enhancement via Gemma

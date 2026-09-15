@@ -15,6 +15,7 @@ Four pipeline types are available via the `--pipeline` flag:
 | Pipeline | Description | CFG | Stages | Speed |
 |----------|-------------|-----|--------|-------|
 | `distilled` (default) | Fixed sigma schedule, no CFG | No | 2 (8+3 steps) | Fastest |
+| `dfr` | Generated keyframes + IC-LoRA spatial detailing | No | 2 (8+3 steps) | Production quality |
 | `dev` | Dynamic sigmas, constant CFG | Yes | 1 (30 steps) | Medium |
 | `dev-two-stage` | Dev + LoRA refinement | Yes (stage 1) | 2 (30+3 steps) | Slow |
 | `dev-two-stage-hq` | res_2s sampler + LoRA both stages | Yes (stage 1) | 2 (15+3 steps) | Slow, highest quality |
@@ -82,6 +83,31 @@ rendered as a smooth transition. For stronger continuity, keep the character,
 wardrobe, environment, lighting, and visual style descriptions consistent
 across shots. When using `--enhance-prompt`, verify that the expanded prompt
 preserves the requested shot structure.
+
+### Diffusion Fidelity Rendering (DFR)
+
+LTX-2.5 DFR adds generated keyframe slots to the base pass, then uses the
+half-resolution result as an in-context reference for a detailing IC-LoRA at
+full resolution. The initial MLX path uses the convolutional video VAE and
+supports T2V with optional generated audio. Accept the terms for both gated
+repositories before the first run:
+
+```bash
+uv run mlx_video.generate --model-repo Lightricks/LTX-2.5 \
+    --pipeline dfr \
+    --prompt "A red fox walking through sunlit grass, detailed fur, cinematic" \
+    --num-frames 121 --width 768 --height 512
+```
+
+The official detailing adapter is downloaded from
+`Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler` by default. Override it
+with `--detailing-lora PATH_OR_REPO`; its default merge strength is `0.5` and
+can be changed with `--detailing-lora-strength`.
+
+DFR may pad its internal canvas to a 24- or 32-frame segment boundary and trims
+the decoded result back to the requested frame count. Image conditioning,
+A2V, temporal upscaling, streaming, and diffusion-VAE decoding are not yet
+supported by this initial path.
 
 ### Image-to-Video (I2V)
 
@@ -176,7 +202,7 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--prompt`, `-p` | (required) | Text description of the video |
-| `--pipeline` | `distilled` | Pipeline type: `distilled`, `dev`, `dev-two-stage`, or `dev-two-stage-hq` |
+| `--pipeline` | `distilled` | Pipeline type: `distilled`, `dfr`, `dev`, `dev-two-stage`, or `dev-two-stage-hq` |
 | `--height`, `-H` | 512 | Output height (divisible by 64 for two-stage, 32 for dev) |
 | `--width`, `-W` | 512 | Output width (divisible by 64 for two-stage, 32 for dev) |
 | `--num-frames`, `-n` | 33 for LTX-2/2.3; predicted for LTX-2.5 | Number of frames (must be 1 + 8*k) |
@@ -197,6 +223,8 @@ uv run mlx_video.upscale --input video.mp4 --output upscaled.mp4 --refine --prom
 | `--tiling` | `auto` | VAE tiling mode: `auto`, `none`, `aggressive`, `conservative` |
 | `--stream` | false | Stream frames as they decode |
 | `--spatial-upscaler` | auto (x2) | Spatial upscaler file for two-stage pipelines (see below) |
+| `--detailing-lora` | official LTX-2.5 adapter | DFR detailing IC-LoRA path or repository |
+| `--detailing-lora-strength` | `0.5` | DFR detailing IC-LoRA merge strength |
 
 ### Spatial Upscalers (LTX-2.3)
 
