@@ -133,9 +133,10 @@ keyframe query attend to its two nearest video frames.
 
 Stage 4 and stage 5 can be spatially tiled with a receptive-field halo. For
 example, `--diffusion-vae-spatial-tiles 2` processes a 2x2 tile grid to reduce
-peak memory at the cost of repeated halo computation. Temporal tiling and DFR
-keyframe-aware tiling are not yet supported. The convolutional decoder remains
-the default lower-memory path.
+peak memory at the cost of repeated halo computation. The same spatial tiling
+works for DFR keyframe-aware decoding by cropping every keyframe plane to the
+video tile's halo. Temporal tiling is not yet supported. The convolutional
+decoder remains the default lower-memory path.
 
 ### Image-to-Video (I2V)
 

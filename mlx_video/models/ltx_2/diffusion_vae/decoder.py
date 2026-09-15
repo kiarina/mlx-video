@@ -389,8 +389,6 @@ class DiffusionVideoDecoder(nn.Module):
                 raise ValueError(
                     "keyframe positions must match the keyframe latent planes"
                 )
-            if spatial_tiles != 1:
-                raise ValueError("keyframe-aware DiffVAE tiling is not implemented yet")
             positions = mx.array(keyframe_positions, dtype=mx.int32)
             stage4_input, keyframe_input = self._stages_1_to_3_joint(
                 latent, keyframe_latents, positions
@@ -413,7 +411,21 @@ class DiffusionVideoDecoder(nn.Module):
             ),
             dtype=stage4_input.dtype,
         )
-        mx.eval(stage4_input, full_noise)
+        full_keyframe_noise = None
+        if use_keyframes:
+            full_keyframe_noise = mx.random.normal(
+                (
+                    latent.shape[0],
+                    self.out_channels,
+                    keyframe_latents.shape[2],
+                    stage4_input.shape[2] * pixel_scale_h,
+                    stage4_input.shape[3] * pixel_scale_w,
+                ),
+                dtype=stage4_input.dtype,
+            )
+            mx.eval(stage4_input, keyframe_input, full_noise, full_keyframe_noise)
+        else:
+            mx.eval(stage4_input, full_noise)
 
         if spatial_tiles == 1:
             if use_keyframes:
@@ -423,21 +435,11 @@ class DiffusionVideoDecoder(nn.Module):
                     positions,
                     output_frames,
                 )
-                keyframe_noise = mx.random.normal(
-                    (
-                        latent.shape[0],
-                        self.out_channels,
-                        keyframe_latents.shape[2],
-                        context.shape[2] * self.patch_size,
-                        context.shape[3] * self.patch_size,
-                    ),
-                    dtype=context.dtype,
-                )
                 return self._diffuse_joint(
                     context,
                     full_noise,
                     keyframe_context,
-                    keyframe_noise,
+                    full_keyframe_noise,
                     self._keyframe_times(positions, 1),
                 )[:, :, :output_frames]
             context = self._stage_4(stage4_input, output_frames)
@@ -455,7 +457,6 @@ class DiffusionVideoDecoder(nn.Module):
                 input_w0 = max(0, core_w0 - halo_w)
                 input_w1 = min(stage4_input.shape[3], core_w1 + halo_w)
                 feature = stage4_input[:, :, input_h0:input_h1, input_w0:input_w1]
-                context = self._stage_4(feature, output_frames)
                 noise = full_noise[
                     :,
                     :,
@@ -463,7 +464,33 @@ class DiffusionVideoDecoder(nn.Module):
                     input_h0 * pixel_scale_h : input_h1 * pixel_scale_h,
                     input_w0 * pixel_scale_w : input_w1 * pixel_scale_w,
                 ]
-                decoded = self._diffuse(context, noise)[:, :, :output_frames]
+                if use_keyframes:
+                    keyframe_feature = keyframe_input[
+                        :, :, input_h0:input_h1, input_w0:input_w1
+                    ]
+                    context, keyframe_context = self._stage_4_joint(
+                        feature,
+                        keyframe_feature,
+                        positions,
+                        output_frames,
+                    )
+                    keyframe_noise = full_keyframe_noise[
+                        :,
+                        :,
+                        :,
+                        input_h0 * pixel_scale_h : input_h1 * pixel_scale_h,
+                        input_w0 * pixel_scale_w : input_w1 * pixel_scale_w,
+                    ]
+                    decoded = self._diffuse_joint(
+                        context,
+                        noise,
+                        keyframe_context,
+                        keyframe_noise,
+                        self._keyframe_times(positions, 1),
+                    )[:, :, :output_frames]
+                else:
+                    context = self._stage_4(feature, output_frames)
+                    decoded = self._diffuse(context, noise)[:, :, :output_frames]
                 mx.eval(decoded)
                 mx.clear_cache()
                 local_h0 = (core_h0 - input_h0) * pixel_scale_h

@@ -87,3 +87,12 @@ def test_keyframe_aware_decoder_runs_both_streams():
     mx.eval(output)
     assert output.shape == (1, 1, 1, 96, 96)
     assert mx.all(mx.isfinite(output))
+    tiled = model(
+        latent,
+        seed=43,
+        spatial_tiles=2,
+        keyframe_latents=keyframes,
+        keyframe_positions=[0],
+    )
+    mx.eval(tiled)
+    assert mx.allclose(tiled, output, atol=2e-4, rtol=2e-4)
