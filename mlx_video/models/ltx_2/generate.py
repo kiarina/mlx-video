@@ -474,6 +474,36 @@ def compute_audio_frames(num_video_frames: int, fps: float) -> int:
     return round(duration * AUDIO_LATENTS_PER_SECOND)
 
 
+def euler_ancestral_step(
+    sample: mx.array,
+    denoised_sample: mx.array,
+    sigma: float,
+    sigma_next: float,
+    key: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Apply LTX-2.5's rectified-flow ancestral Euler update."""
+    if sigma_next == 0:
+        return denoised_sample, key
+
+    downstep_ratio = sigma_next / sigma
+    sigma_down = sigma_next * downstep_ratio
+    sigma_down_ratio = sigma_down / sigma
+    result = sigma_down_ratio * sample + (1.0 - sigma_down_ratio) * denoised_sample
+    alpha_next = 1.0 - sigma_next
+    alpha_down = 1.0 - sigma_down
+    coefficient = (
+        max(
+            sigma_next**2 - sigma_down**2 * alpha_next**2 / alpha_down**2,
+            0.0,
+        )
+        ** 0.5
+    )
+    next_key, step_key = mx.random.split(key)
+    noise = mx.random.normal(sample.shape, dtype=mx.float32, key=step_key)
+    result = (alpha_next / alpha_down) * result + noise * coefficient
+    return result, next_key
+
+
 # =============================================================================
 # Distilled Pipeline Denoising (no CFG, fixed sigmas)
 # =============================================================================
@@ -509,32 +539,6 @@ def denoise_distilled(
     desc = "[cyan]Denoising A/V[/]" if enable_audio else "[cyan]Denoising[/]"
     num_steps = len(sigmas) - 1
     noise_key = mx.random.key(noise_seed)
-
-    def ancestral_step(
-        sample: mx.array,
-        denoised_sample: mx.array,
-        sigma: float,
-        sigma_next: float,
-    ) -> mx.array:
-        nonlocal noise_key
-        if sigma_next == 0:
-            return denoised_sample
-        downstep_ratio = sigma_next / sigma
-        sigma_down = sigma_next * downstep_ratio
-        sigma_down_ratio = sigma_down / sigma
-        result = sigma_down_ratio * sample + (1.0 - sigma_down_ratio) * denoised_sample
-        alpha_next = 1.0 - sigma_next
-        alpha_down = 1.0 - sigma_down
-        coefficient = (
-            max(
-                sigma_next**2 - sigma_down**2 * alpha_next**2 / alpha_down**2,
-                0.0,
-            )
-            ** 0.5
-        )
-        noise_key, step_key = mx.random.split(noise_key)
-        noise = mx.random.normal(sample.shape, dtype=mx.float32, key=step_key)
-        return (alpha_next / alpha_down) * result + noise * coefficient
 
     with Progress(
         SpinnerColumn(),
@@ -640,7 +644,9 @@ def denoise_distilled(
             # LTX-2.5 distilled uses ancestral Euler for stage 1. Older
             # checkpoints and stage 2 retain the deterministic Euler update.
             if ancestral:
-                latents = ancestral_step(latents, denoised, sigma, sigma_next)
+                latents, noise_key = euler_ancestral_step(
+                    latents, denoised, sigma, sigma_next, noise_key
+                )
                 if state is not None:
                     latents = apply_denoise_mask(
                         latents,
@@ -648,8 +654,12 @@ def denoise_distilled(
                         state.denoise_mask,
                     )
                 if enable_audio and audio_denoised is not None and not audio_frozen:
-                    audio_latents = ancestral_step(
-                        audio_latents, audio_denoised, sigma, sigma_next
+                    audio_latents, noise_key = euler_ancestral_step(
+                        audio_latents,
+                        audio_denoised,
+                        sigma,
+                        sigma_next,
+                        noise_key,
                     )
             elif sigma_next > 0:
                 sigma_next_f32 = mx.array(sigma_next, dtype=mx.float32)
