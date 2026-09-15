@@ -66,6 +66,7 @@ LTX25_REQUIRED_FILES = [
     "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
     "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
     "vae/ltx-2.5-video-vae-conv-bf16.safetensors",
+    "vae/ltx-2.5-audio-vae-bf16.safetensors",
     "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
 ]
 
@@ -1669,7 +1670,11 @@ def load_audio_decoder(model_path: Path, pipeline: PipelineType):
     """Load audio VAE decoder."""
     from mlx_video.models.ltx_2.audio_vae import AudioDecoder
 
-    decoder = AudioDecoder.from_pretrained(model_path / "audio_vae" / "decoder")
+    split_files = sorted((model_path / "vae").glob("*audio-vae-bf16.safetensors"))
+    decoder_path = (
+        split_files[0] if split_files else model_path / "audio_vae" / "decoder"
+    )
+    decoder = AudioDecoder.from_pretrained(decoder_path)
 
     return decoder
 
@@ -1681,7 +1686,9 @@ def load_vocoder_model(model_path: Path, pipeline: PipelineType):
     """
     from mlx_video.models.ltx_2.audio_vae.vocoder import load_vocoder as _load_vocoder
 
-    return _load_vocoder(model_path / "vocoder")
+    split_files = sorted((model_path / "vae").glob("*audio-vae-bf16.safetensors"))
+    vocoder_path = split_files[0] if split_files else model_path / "vocoder"
+    return _load_vocoder(vocoder_path)
 
 
 def save_audio(audio: np.ndarray, path: Path, sample_rate: int = AUDIO_SAMPLE_RATE):
@@ -1716,6 +1723,8 @@ def mux_video_audio(video_path: Path, audio_path: Path, output_path: Path):
         "copy",
         "-c:a",
         "aac",
+        "-af",
+        "apad",
         "-shortest",
         str(output_path),
     ]
@@ -1940,10 +1949,6 @@ def generate_video(
     if is_ltx25_split:
         if pipeline is not PipelineType.DISTILLED:
             raise ValueError("LTX-2.5 currently supports only the distilled pipeline")
-        if audio or is_a2v:
-            raise ValueError(
-                "LTX-2.5 audio generation and audio conditioning are not yet supported"
-            )
         transformer_files = sorted(
             (model_path / "diffusion_models").glob(
                 "*distilled-transformer-bf16.safetensors"
@@ -1955,14 +1960,23 @@ def generate_video(
         conv_vae_files = sorted(
             (model_path / "vae").glob("*video-vae-conv-bf16.safetensors")
         )
-        if not transformer_files or not text_encoder_files or not conv_vae_files:
+        audio_vae_files = sorted(
+            (model_path / "vae").glob("*audio-vae-bf16.safetensors")
+        )
+        if (
+            not transformer_files
+            or not text_encoder_files
+            or not conv_vae_files
+            or not audio_vae_files
+        ):
             raise FileNotFoundError(
                 "LTX-2.5 split layout requires a distilled transformer, "
-                "Gemma 4 text encoder, and convolutional video VAE"
+                "Gemma 4 text encoder, convolutional video VAE, and audio VAE"
             )
         transformer_path = transformer_files[0]
         text_encoder_path = text_encoder_files[0]
         video_vae_path = conv_vae_files[0]
+        audio_vae_path = audio_vae_files[0]
     else:
         transformer_path = model_path / "transformer"
         text_encoder_path = (
@@ -1971,6 +1985,7 @@ def generate_video(
             else get_model_path(text_encoder_repo)
         )
         video_vae_path = model_path / "vae"
+        audio_vae_path = None
 
     # Resolve spatial upscaler path for two-stage pipelines
     upscaler_path = None
@@ -2146,10 +2161,13 @@ def generate_video(
             )
 
             # Convert audio encoder weights if needed, then load
-            encoder_dir = convert_audio_encoder(
-                model_path, source_repo="Lightricks/LTX-2"
-            )
-            audio_encoder = AudioEncoder.from_pretrained(encoder_dir)
+            if is_ltx25_split:
+                audio_encoder = AudioEncoder.from_pretrained(audio_vae_path)
+            else:
+                encoder_dir = convert_audio_encoder(
+                    model_path, source_repo="Lightricks/LTX-2"
+                )
+                audio_encoder = AudioEncoder.from_pretrained(encoder_dir)
             mx.eval(audio_encoder.parameters())
 
             # Encode: (1, 2, time, 64) -> normalized latents
