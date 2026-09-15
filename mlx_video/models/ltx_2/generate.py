@@ -483,6 +483,8 @@ def denoise_distilled(
     audio_positions: Optional[mx.array] = None,
     audio_embeddings: Optional[mx.array] = None,
     audio_frozen: bool = False,
+    ancestral: bool = False,
+    noise_seed: int = 42,
 ) -> tuple[mx.array, Optional[mx.array]]:
     """Run denoising loop for distilled pipeline (no CFG)."""
     dtype = latents.dtype
@@ -498,6 +500,33 @@ def denoise_distilled(
 
     desc = "[cyan]Denoising A/V[/]" if enable_audio else "[cyan]Denoising[/]"
     num_steps = len(sigmas) - 1
+    noise_key = mx.random.key(noise_seed)
+
+    def ancestral_step(
+        sample: mx.array,
+        denoised_sample: mx.array,
+        sigma: float,
+        sigma_next: float,
+    ) -> mx.array:
+        nonlocal noise_key
+        if sigma_next == 0:
+            return denoised_sample
+        downstep_ratio = sigma_next / sigma
+        sigma_down = sigma_next * downstep_ratio
+        sigma_down_ratio = sigma_down / sigma
+        result = sigma_down_ratio * sample + (1.0 - sigma_down_ratio) * denoised_sample
+        alpha_next = 1.0 - sigma_next
+        alpha_down = 1.0 - sigma_down
+        coefficient = (
+            max(
+                sigma_next**2 - sigma_down**2 * alpha_next**2 / alpha_down**2,
+                0.0,
+            )
+            ** 0.5
+        )
+        noise_key, step_key = mx.random.split(noise_key)
+        noise = mx.random.normal(sample.shape, dtype=mx.float32, key=step_key)
+        return (alpha_next / alpha_down) * result + noise * coefficient
 
     with Progress(
         SpinnerColumn(),
@@ -525,8 +554,10 @@ def denoise_distilled(
                 denoise_mask_flat = mx.broadcast_to(denoise_mask_flat, (b, 1, f, h, w))
                 denoise_mask_flat = mx.reshape(denoise_mask_flat, (b, num_tokens))
                 timesteps = mx.array(sigma, dtype=dtype) * denoise_mask_flat
+                keyframes_mask = 1 - denoise_mask_flat
             else:
                 timesteps = mx.full((b, num_tokens), sigma, dtype=dtype)
+                keyframes_mask = None
 
             video_modality = Modality(
                 latent=latents_flat,
@@ -536,6 +567,7 @@ def denoise_distilled(
                 context_mask=None,
                 enabled=True,
                 sigma=mx.full((b,), sigma, dtype=dtype),
+                keyframes_mask=keyframes_mask,
             )
 
             audio_modality = None
@@ -597,8 +629,21 @@ def denoise_distilled(
             if audio_denoised is not None:
                 mx.eval(audio_denoised)
 
-            # Euler step in float32
-            if sigma_next > 0:
+            # LTX-2.5 distilled uses ancestral Euler for stage 1. Older
+            # checkpoints and stage 2 retain the deterministic Euler update.
+            if ancestral:
+                latents = ancestral_step(latents, denoised, sigma, sigma_next)
+                if state is not None:
+                    latents = apply_denoise_mask(
+                        latents,
+                        state.clean_latent.astype(mx.float32),
+                        state.denoise_mask,
+                    )
+                if enable_audio and audio_denoised is not None and not audio_frozen:
+                    audio_latents = ancestral_step(
+                        audio_latents, audio_denoised, sigma, sigma_next
+                    )
+            elif sigma_next > 0:
                 sigma_next_f32 = mx.array(sigma_next, dtype=mx.float32)
                 latents = denoised + sigma_next_f32 * (latents - denoised) / sigma_f32
                 if enable_audio and audio_denoised is not None and not audio_frozen:
@@ -1870,9 +1915,35 @@ def generate_video(
 
     # Get model path
     model_path = get_model_path(model_repo)
-    text_encoder_path = (
-        model_path if text_encoder_repo is None else get_model_path(text_encoder_repo)
-    )
+    is_ltx25_split = (model_path / "diffusion_models").is_dir()
+    if is_ltx25_split:
+        transformer_files = sorted(
+            (model_path / "diffusion_models").glob(
+                "*distilled-transformer-bf16.safetensors"
+            )
+        )
+        text_encoder_files = sorted(
+            (model_path / "text_encoders").glob("gemma4-*-bf16.safetensors")
+        )
+        conv_vae_files = sorted(
+            (model_path / "vae").glob("*video-vae-conv-bf16.safetensors")
+        )
+        if not transformer_files or not text_encoder_files or not conv_vae_files:
+            raise FileNotFoundError(
+                "LTX-2.5 split layout requires a distilled transformer, "
+                "Gemma 4 text encoder, and convolutional video VAE"
+            )
+        transformer_path = transformer_files[0]
+        text_encoder_path = text_encoder_files[0]
+        video_vae_path = conv_vae_files[0]
+    else:
+        transformer_path = model_path / "transformer"
+        text_encoder_path = (
+            model_path
+            if text_encoder_repo is None
+            else get_model_path(text_encoder_repo)
+        )
+        video_vae_path = model_path / "vae"
 
     # Resolve spatial upscaler path for two-stage pipelines
     upscaler_path = None
@@ -1897,6 +1968,10 @@ def generate_video(
             # Auto-detect: prefer x2 upscaler
             upscaler_files = sorted(
                 model_path.glob("*spatial-upscaler-x2*.safetensors")
+            ) or sorted(
+                (model_path / "latent_upscale_models").glob(
+                    "*spatial-upscaler-x2*.safetensors"
+                )
             )
             if upscaler_files:
                 upscaler_path = upscaler_files[0]
@@ -1918,9 +1993,9 @@ def generate_video(
     # Read transformer config to detect model version
     import json
 
-    transformer_config_path = model_path / "transformer" / "config.json"
-    has_prompt_adaln = False
-    if transformer_config_path.exists():
+    transformer_config_path = transformer_path / "config.json"
+    has_prompt_adaln = is_ltx25_split
+    if not is_ltx25_split and transformer_config_path.exists():
         with open(transformer_config_path) as f:
             has_prompt_adaln = json.load(f).get("has_prompt_adaln", False)
 
@@ -1985,9 +2060,7 @@ def generate_video(
     # Load transformer
     transformer_desc = f"🤖 Loading {pipeline_name.lower()} transformer{' (A/V mode)' if audio else ''}..."
     with console.status(f"[blue]{transformer_desc}[/]", spinner="dots"):
-        transformer = LTXModel.from_pretrained(
-            model_path=model_path / "transformer", strict=True
-        )
+        transformer = LTXModel.from_pretrained(model_path=transformer_path, strict=True)
 
     console.print("[green]✓[/] Transformer loaded")
 
@@ -1998,8 +2071,11 @@ def generate_video(
             stg_blocks = [28]
         else:
             stg_blocks = [29]
+        model_label = transformer.config.model_version or (
+            "2.3" if transformer.config.has_prompt_adaln else "2"
+        )
         console.print(
-            f"[dim]Auto-detected STG blocks: {stg_blocks} (model={'2.3' if transformer.config.has_prompt_adaln else '2'})[/]"
+            f"[dim]Auto-detected STG blocks: {stg_blocks} (model={model_label})[/]"
         )
 
     # ==========================================================================
@@ -2096,7 +2172,7 @@ def generate_video(
                 "[blue]🖼️  Loading VAE encoder and encoding image(s)...[/]", spinner="dots"
             ):
                 vae_encoder = VideoEncoder.from_pretrained(
-                    model_path / "vae" / "encoder"
+                    video_vae_path if is_ltx25_split else video_vae_path / "encoder"
                 )
 
                 s1_h, s1_w = stage1_h * 32, stage1_w * 32
@@ -2186,6 +2262,8 @@ def generate_video(
             audio_positions=audio_positions,
             audio_embeddings=audio_embeddings,
             audio_frozen=is_a2v,
+            ancestral=is_ltx25_split,
+            noise_seed=seed + 10000,
         )
 
         # Upsample latents
@@ -2198,7 +2276,7 @@ def generate_video(
             mx.eval(upsampler.parameters())
 
             vae_decoder = VideoDecoder.from_pretrained(
-                str(model_path / "vae" / "decoder")
+                video_vae_path if is_ltx25_split else video_vae_path / "decoder"
             )
 
             latents = upsample_latents(
@@ -2288,7 +2366,7 @@ def generate_video(
                 "[blue]🖼️  Loading VAE encoder and encoding image(s)...[/]", spinner="dots"
             ):
                 vae_encoder = VideoEncoder.from_pretrained(
-                    model_path / "vae" / "encoder"
+                    video_vae_path if is_ltx25_split else video_vae_path / "encoder"
                 )
 
                 if image is not None:
@@ -2390,7 +2468,9 @@ def generate_video(
         )
 
         # Load VAE decoder (for dev pipeline, loaded here instead of during upsampling)
-        vae_decoder = VideoDecoder.from_pretrained(str(model_path / "vae" / "decoder"))
+        vae_decoder = VideoDecoder.from_pretrained(
+            video_vae_path if is_ltx25_split else video_vae_path / "decoder"
+        )
 
     elif pipeline == PipelineType.DEV_TWO_STAGE:
         # ======================================================================
@@ -2410,7 +2490,7 @@ def generate_video(
                 "[blue]🖼️  Loading VAE encoder and encoding image(s)...[/]", spinner="dots"
             ):
                 vae_encoder = VideoEncoder.from_pretrained(
-                    model_path / "vae" / "encoder"
+                    video_vae_path if is_ltx25_split else video_vae_path / "encoder"
                 )
 
                 s1_h, s1_w = stage1_h * 32, stage1_w * 32
@@ -2532,7 +2612,7 @@ def generate_video(
             mx.eval(upsampler.parameters())
 
             vae_decoder = VideoDecoder.from_pretrained(
-                str(model_path / "vae" / "decoder")
+                video_vae_path if is_ltx25_split else video_vae_path / "decoder"
             )
 
             latents = upsample_latents(
@@ -2664,7 +2744,7 @@ def generate_video(
                 "[blue]Loading VAE encoder and encoding image(s)...[/]", spinner="dots"
             ):
                 vae_encoder = VideoEncoder.from_pretrained(
-                    model_path / "vae" / "encoder"
+                    video_vae_path if is_ltx25_split else video_vae_path / "encoder"
                 )
 
                 s1_h, s1_w = stage1_h * 32, stage1_w * 32
@@ -2806,7 +2886,7 @@ def generate_video(
             mx.eval(upsampler.parameters())
 
             vae_decoder = VideoDecoder.from_pretrained(
-                str(model_path / "vae" / "decoder")
+                video_vae_path if is_ltx25_split else video_vae_path / "decoder"
             )
 
             latents = upsample_latents(
