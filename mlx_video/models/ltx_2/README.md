@@ -64,6 +64,25 @@ uv run mlx_video.generate --pipeline dev-two-stage-hq \
     --lora-strength-stage-1 0.3 --lora-strength-stage-2 0.6
 ```
 
+### Multishot generation
+
+LTX-2.5 can generate multiple shots through the regular T2V path. Describe the
+shots in order, repeat important subject details in each shot, and allocate
+enough frames for the requested sequence:
+
+```bash
+uv run mlx_video.generate --model-repo Lightricks/LTX-2.5 \
+    --prompt "A cinematic three-shot sequence featuring the same woman with short silver hair, a yellow raincoat, and a red scarf throughout. Shot 1: a medium tracking shot as she walks through a rainy neon-lit alley. Cut to Shot 2: a close-up of the same woman under her umbrella, with the same clothes and alley behind her. Cut to Shot 3: a wide shot of the same woman entering a warm-lit shop, still wearing the same yellow raincoat and red scarf. Maintain the same face, hairstyle, wardrobe, environment, and color grade across all three shots." \
+    --num-frames 241 --width 768 --height 512
+```
+
+Multishot is prompt-driven rather than a frame-accurate editing interface. Shot
+lengths and cut positions are not guaranteed, and an explicit hard cut may be
+rendered as a smooth transition. For stronger continuity, keep the character,
+wardrobe, environment, lighting, and visual style descriptions consistent
+across shots. When using `--enhance-prompt`, verify that the expanded prompt
+preserves the requested shot structure.
+
 ### Image-to-Video (I2V)
 
 ```bash
