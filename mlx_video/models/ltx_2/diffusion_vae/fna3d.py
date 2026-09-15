@@ -156,6 +156,55 @@ _METAL_SOURCE = r"""
 """
 
 
+_METAL_SOURCE_HD64 = r"""
+    uint group = threadgroup_position_in_grid.x;
+    uint lane = thread_index_in_simdgroup;
+    uint total = q_shape[0] * q_shape[1] * q_shape[2] * q_shape[3] * q_shape[4];
+    if (group >= total) return;
+
+    uint head = group % q_shape[4];
+    uint position = group / q_shape[4];
+    uint column = position % q_shape[3];
+    position /= q_shape[3];
+    uint row = position % q_shape[2];
+    position /= q_shape[2];
+    uint frame = position % q_shape[1];
+    uint batch = position / q_shape[1];
+
+    int fs = min(max(int(frame) - KT / 2, 0), int(q_shape[1]) - KT);
+    int hs = min(max(int(row) - KH / 2, 0), int(q_shape[2]) - KH);
+    int ws = min(max(int(column) - KW / 2, 0), int(q_shape[3]) - KW);
+    uint q_base = (((((batch * q_shape[1] + frame) * q_shape[2] + row)
+        * q_shape[3] + column) * q_shape[4] + head) * 64);
+
+    float accumulator0 = 0.0f;
+    float accumulator1 = 0.0f;
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    for (int ft = 0; ft < KT; ++ft) {
+        for (int hh = 0; hh < KH; ++hh) {
+            for (int ww = 0; ww < KW; ++ww) {
+                uint kv_base = (((((batch * q_shape[1] + uint(fs + ft)) * q_shape[2]
+                    + uint(hs + hh)) * q_shape[3] + uint(ws + ww)) * q_shape[4]
+                    + head) * 64);
+                float partial = float(q[q_base + lane]) * float(k[kv_base + lane]);
+                partial += float(q[q_base + lane + 32]) * float(k[kv_base + lane + 32]);
+                float score = simd_sum(partial) * float(attention_scale[0]);
+                float next_max = max(running_max, score);
+                float correction = metal::exp(running_max - next_max);
+                float weight = metal::exp(score - next_max);
+                running_sum = running_sum * correction + weight;
+                accumulator0 = accumulator0 * correction + weight * float(v[kv_base + lane]);
+                accumulator1 = accumulator1 * correction + weight * float(v[kv_base + lane + 32]);
+                running_max = next_max;
+            }
+        }
+    }
+    out[q_base + lane] = T(accumulator0 / running_sum);
+    out[q_base + lane + 32] = T(accumulator1 / running_sum);
+"""
+
+
 @functools.cache
 def _metal_kernel() -> object:
     return mx.fast.metal_kernel(
@@ -163,6 +212,17 @@ def _metal_kernel() -> object:
         input_names=["q", "k", "v", "attention_scale"],
         output_names=["out"],
         source=_METAL_SOURCE,
+        ensure_row_contiguous=True,
+    )
+
+
+@functools.cache
+def _metal_kernel_hd64() -> object:
+    return mx.fast.metal_kernel(
+        name="ltx_diffvae_na3d_hd64_forward",
+        input_names=["q", "k", "v", "attention_scale"],
+        output_names=["out"],
+        source=_METAL_SOURCE_HD64,
         ensure_row_contiguous=True,
     )
 
@@ -180,19 +240,35 @@ def neighborhood_attention_3d(
     head_dim = query.shape[-1]
     scale = head_dim**-0.5 if scale is None else scale
     total_queries = math.prod(query.shape[:-1])
-    output = _metal_kernel()(
-        inputs=[query, key, value, mx.array([scale], dtype=mx.float32)],
-        template=[
+    common = {
+        "inputs": [query, key, value, mx.array([scale], dtype=mx.float32)],
+        "template": [
             ("T", query.dtype),
             ("KT", kernel_size[0]),
             ("KH", kernel_size[1]),
             ("KW", kernel_size[2]),
+        ],
+        "output_shapes": [query.shape],
+        "output_dtypes": [query.dtype],
+    }
+    if head_dim == 64:
+        output = _metal_kernel_hd64()(
+            **common,
+            grid=(total_queries * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+        )[0]
+        return output
+
+    output = _metal_kernel()(
+        template=[
+            *common["template"],
             ("HD", head_dim),
             ("MAX_HD", _MAX_HEAD_DIM),
         ],
+        inputs=common["inputs"],
         grid=(total_queries, 1, 1),
         threadgroup=(min(256, total_queries), 1, 1),
-        output_shapes=[query.shape],
-        output_dtypes=[query.dtype],
+        output_shapes=common["output_shapes"],
+        output_dtypes=common["output_dtypes"],
     )[0]
     return output

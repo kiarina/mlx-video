@@ -32,6 +32,18 @@ def test_metal_fna3d_supports_ltx_kernel_and_head_dimension():
     assert mx.all(mx.isfinite(output))
 
 
+def test_simd_head_dim_64_kernel_matches_reference():
+    mx.random.seed(19)
+    shape = (1, 4, 4, 4, 1, 64)
+    query = mx.random.normal(shape).astype(mx.bfloat16)
+    key = mx.random.normal(shape).astype(mx.bfloat16)
+    value = mx.random.normal(shape).astype(mx.bfloat16)
+    expected = neighborhood_attention_3d_reference(query, key, value, (3, 3, 3))
+    actual = neighborhood_attention_3d(query, key, value, (3, 3, 3))
+    mx.eval(actual)
+    assert mx.allclose(actual, expected, atol=3e-2, rtol=3e-2)
+
+
 def test_fna3d_rejects_invalid_shapes():
     tensor = mx.zeros((1, 3, 3, 3, 1, 8))
     with pytest.raises(ValueError, match="positive odd"):
